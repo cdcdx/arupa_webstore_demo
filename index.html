@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>逐风扩展商店 Demo</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">LOCAL EXTENSION CATALOG</p>
+        <h1>逐风扩展商店 <span>Demo</span></h1>
+        <p class="intro">从本机 <code>packages/</code> 读取 CRX3。签名、权限、安装与升级事务仍由逐风浏览器原生验证。</p>
+      </div>
+      <a class="secondary-action" href="/docs">查看接口文档</a>
+    </header>
+
+    <section class="panel" aria-labelledby="catalog-heading">
+      <div class="toolbar">
+        <div>
+          <p class="section-label">CATALOG</p>
+          <h2 id="catalog-heading">目录插件</h2>
+        </div>
+        <button id="refresh" type="button">刷新插件列表</button>
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite">正在读取本地目录…</div>
+      <progress id="download-progress" aria-label="CRX 下载进度" hidden></progress>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>插件</th><th>目录版本</th><th>大小</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="packages"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>仅监听 <code>127.0.0.1:18731</code>，不连接 Google 商店，也不提供上传接口。</footer>
+  </main>
+</body>
+</html>

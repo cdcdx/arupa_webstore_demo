@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>接口文档 · 逐风扩展商店 Demo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="docs-page">
+  <p><a href="/">← 返回插件列表</a></p>
+  <h1>安装、升级、卸载接口文档</h1>
+  <p>本站仅提供目录和 CRX 文件；网页不能直接修改浏览器的插件目录。安装、升级、卸载通过逐风浏览器在本站授权的 <code>chrome.*</code> 接口完成，并由原生安装器校验和确认。整个流程不查询 Google 商店。</p>
+
+  <section>
+    <h2>运行前提</h2>
+    <ol>
+      <li>双击 <code>start.command</code>（macOS）或 <code>start.bat</code>（Windows），Linux 运行 <code>./start.sh</code>；把 CRX3 放在 <code>packages/</code>。</li>
+      <li>如需使用安装功能，让逐风浏览器以 <code>--apps-gallery-url=http://127.0.0.1:18731/</code> 启动；可通过 <code>ARUPA_BROWSER</code> 配置一键启动脚本。</li>
+      <li>在地址栏打开 <code>http://127.0.0.1:18731/</code>。只有这个顶层页面能使用下述浏览器接口；普通 Chrome、其他站点或端口不支持。</li>
+    </ol>
+    <p>安装、卸载、应用升级必须由用户点击触发；隐身页面和已失效的标签页会被拒绝。原生确认框不能由网页绕过。</p>
+  </section>
+
+  <section>
+    <h2>网站 HTTP 接口（只读）</h2>
+    <table>
+      <thead><tr><th>接口</th><th>返回</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /api/catalog</code></td><td>JSON：<code>packages[]</code>、<code>errors[]</code></td><td>扫描 <code>packages/*.crx</code>；同一插件 ID 只列最高版本。</td></tr>
+        <tr><td><code>GET /api/package?id=&lt;32位插件ID&gt;</code></td><td><code>application/x-chrome-extension</code></td><td>浏览器内部按 ID 取得目录中的当前最高版本 CRX。</td></tr>
+        <tr><td><code>GET /api/health</code></td><td>JSON：服务状态与标识</td><td>供一键启动脚本识别已运行的 Demo 服务。</td></tr>
+      </tbody>
+    </table>
+    <p><code>packages[]</code> 每项包括 <code>id</code>、<code>name</code>、<code>version</code>、<code>manifest</code>、<code>sha256</code>、<code>size</code>、<code>file</code> 和 <code>requirements</code>。后者仅提示已扫描到的默认启用规则需求，例如 <code>responseStageRules</code>；它不是浏览器的兼容性或安装校验结果。无效 CRX 在 <code>errors[]</code> 中返回文件名及原因；包接口的 400、404、409 分别表示 ID 无效、未找到、读取时文件已变化。所有 HTTP 接口都不执行安装或卸载。</p>
+  </section>
+
+  <section>
+    <h2>查询安装状态</h2>
+    <pre><code>chrome.management.getAll(items =&gt; {
+  if (chrome.runtime.lastError) throw new Error(chrome.runtime.lastError.message);
+  // 按 id 匹配 catalog.packages；items 中的 version、enabled 用于状态显示。
+});</code></pre>
+    <p>目录版本大于已安装版本时显示“可升级”；已安装但 <code>enabled === false</code> 时显示“已停用”。</p>
+  </section>
+
+  <section>
+    <h2>安装</h2>
+    <ol>
+      <li>从 <code>/api/catalog</code> 读取所选 CRX 的 <code>id</code>、<code>manifest</code> 和 <code>name</code>。</li>
+      <li>在点击事件中立即调用 <code>beginInstallWithManifest3</code>，等待浏览器验证包和弹出原生授权框。</li>
+      <li>回调结果是空字符串且没有 <code>chrome.runtime.lastError</code> 时，在同一标签页调用 <code>completeInstall</code>；随后重新查询安装状态。</li>
+    </ol>
+    <pre><code>chrome.webstorePrivate.beginInstallWithManifest3({
+  id: item.id,
+  manifest: JSON.stringify(item.manifest),
+  localizedName: item.name
+}, result =&gt; {
+  if (chrome.runtime.lastError || result !== '') return; // 安装未获批准
+  chrome.webstorePrivate.completeInstall(item.id, () =&gt; {
+    if (!chrome.runtime.lastError) location.reload();
+  });
+});</code></pre>
+    <p>浏览器会校验 CRX3 作者签名、插件 ID、实际清单与页面预览一致性、权限及 DNR 规则。授权只绑定当前配置和标签页，且有时效；不能把 <code>completeInstall</code> 当作独立安装接口使用。</p>
+  </section>
+
+  <section>
+    <h2>查询取包进度</h2>
+    <p>若浏览器提供 <code>chrome.webstorePrivate.getOperationProgress</code>，点击时用 <code>crypto.randomUUID()</code> 生成本次操作的 <code>operationId</code>。新装将它放入 <code>beginInstallWithManifest3</code> 的详情对象，更新检查用 <code>checkUpdate(id, { operationId }, callback)</code>。在原回调完成前，从发起操作的同一页面调用 <code>getOperationProgress(operationId, callback)</code>，建议间隔 300 毫秒。旧浏览器沿用原调用形式。</p>
+    <pre><code>{ progress: { operationId, operation, extensionId, stage, receivedBytes, totalBytes? } }</code></pre>
+    <p><code>operation</code> 为 <code>install</code> 或 <code>update_check</code>。阶段包括 <code>preparing</code>、<code>downloading</code>、<code>verifying</code>。新装还可进入 <code>opening_confirmation</code>、<code>awaiting_user_confirmation</code>。总大小未知时省略 <code>totalBytes</code>；操作尚未开始或已结束时返回 <code>{}</code>。命中更新暂存包时直接校验。安装批准、更新检查结果、错误和取消仍由原回调处理。</p>
+  </section>
+
+  <section>
+    <h2>升级</h2>
+    <ol>
+      <li>把同一作者签名、同一插件 ID 的更高版本 CRX 放入 <code>packages/</code>，刷新列表。</li>
+      <li>点击“准备升级”调用 <code>checkUpdate(id)</code>。只有返回 <code>state: "ready"</code> 或 <code>"permission_required"</code> 且版本与目录一致，页面才显示“升级”。</li>
+      <li>点击“升级”调用 <code>applyUpdate(id)</code>；若新增权限，浏览器会再次请求原生确认。返回 <code>true</code> 后重新查询状态。</li>
+    </ol>
+    <pre><code>// “准备升级”按钮的点击事件：
+chrome.webstorePrivate.checkUpdate(item.id, status =&gt; {
+  if (chrome.runtime.lastError) return;
+  // status: { state, version, errorCode }
+  if (['ready', 'permission_required'].includes(status.state)) {
+    // 页面显示“升级”按钮；不要在此回调中自动调用 applyUpdate。
+  }
+});
+
+// “升级”按钮的另一次点击事件（必须保留用户激活）：
+chrome.webstorePrivate.applyUpdate(item.id, applied =&gt; {
+  if (applied &amp;&amp; !chrome.runtime.lastError) location.reload();
+});</code></pre>
+    <p>示例包：先安装 <code>packages/nomad-demo-1.0.crx</code>；再把 <code>samples/nomad-demo-1.1.crx</code> 放进 <code>packages/</code>。浏览器按目录包的版本、大小和 SHA-256 校验升级，不使用 Google 商店的升级队列。</p>
+  </section>
+
+  <section>
+    <h2>卸载</h2>
+    <pre><code>chrome.management.uninstall(item.id, { showConfirmDialog: true }, () =&gt; {
+  if (!chrome.runtime.lastError) location.reload();
+});</code></pre>
+    <p>浏览器总会显示原生卸载确认；即使网页传入 <code>showConfirmDialog: false</code> 也不能跳过。用户取消时回调中可通过 <code>chrome.runtime.lastError</code> 得到失败原因。</p>
+  </section>
+
+  <section>
+    <h2>错误与安全边界</h2>
+    <p>浏览器接口的异步错误通过 <code>chrome.runtime.lastError.message</code> 返回；安装预检也可能返回非空结果码。常见原因包括用户取消、当前标签页失效、权限变化、签名或清单不匹配、目录包变化、扩展正在使用。页面应重新读取目录及安装状态后再重试，不能凭按钮状态推断安装成功。</p>
+    <p>当浏览器只返回 <code>dnr_package_invalid</code> 时，本站不会把它解释为 CRX 损坏，也不会仅凭目录扫描断定内核缺少哪项能力。页面会保留原始错误码；若目录扫描发现响应头匹配规则，只将其作为排查线索。只有浏览器明确返回 <code>dnr_kernel_capability_unavailable</code> 时，才提示缺少内核能力。</p>
+    <p>本站固定监听 <code>127.0.0.1:18731</code>，不是公网插件市场。它不接受上传，也没有执行安装/升级/卸载的 HTTP 写接口。<code>chrome.webstorePrivate</code> 是逐风浏览器对特定商店页面开放的特权接口，不是普通网页通用 API。</p>
+  </section>
+</body>
+</html>

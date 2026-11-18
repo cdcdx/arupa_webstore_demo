@@ -296,7 +296,7 @@ GET {storeOrigin}/api/catalog
 | 目录/包结果 | 更新状态/错误 |
 |---|---|
 | 目录没有该 ID | `up_to_date` |
-| 目录版本不高于已安装版本 | `up_to_date` |
+| 版本不高于已安装版本 | `up_to_date` |
 | `/api/catalog` HTTP 非 200 | `error / webstore_update_network_or_io_failed` |
 | Content-Length 超过 8 MiB | `error / webstore_update_network_or_io_failed` |
 | 流式读取超过 8 MiB | `error / store_catalog_too_large` |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback-only HTTP server for the local CRX catalog demo."""
+"""HTTP server for the local CRX catalog demo (loopback + LAN)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -18,7 +19,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from crx_catalog import catalog, valid_extension_id
 
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
+LOOPBACK = "127.0.0.1"
 PORT = 18731
 ROOT = Path(__file__).resolve().parent
 PACKAGES = ROOT / "packages"
@@ -74,12 +76,20 @@ class Handler(BaseHTTPRequestHandler):
             pass  # The browser can cancel the test transfer by closing the page.
 
     def do_GET(self) -> None:
-        expected_host = f"{self.server.server_address[0]}:{self.server.server_address[1]}"
-        if self.headers.get("Host") != expected_host or self.headers.get("Sec-Fetch-Site") not in (
-            None,
-            "same-origin",
-            "none",
-        ):
+        expected_port = self.server.server_address[1]
+        host_header = self.headers.get("Host", "")
+        # Accept any Host that carries our port (covers localhost, 127.0.0.1,
+        # LAN IPs, and hostnames). Reject if the port is explicitly wrong.
+        if ":" in host_header:
+            try:
+                port = int(host_header.rsplit(":", 1)[1])
+                if port != expected_port:
+                    self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
+                    return
+            except ValueError:
+                self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
+                return
+        if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
             self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
             return
 
@@ -188,6 +198,20 @@ def open_demo(url: str, browser: str | None) -> None:
         webbrowser.open(url)
 
 
+def lan_ip() -> str | None:
+    """Best-effort lookup of this machine's LAN IPv4 address."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            # Connect to an external address so the kernel picks the right NIC.
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    return None
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.browser:
@@ -195,7 +219,7 @@ def main(argv: list[str] | None = None) -> None:
         if not browser_path.is_file():
             raise SystemExit(f"逐风浏览器不存在：{browser_path}")
         args.browser = str(browser_path)
-    url = f"http://{HOST}:{PORT}/"
+    url = f"http://{LOOPBACK}:{PORT}/"
     try:
         server = create_server(args.packages_dir, args.package_delay_ms / 1000, args.package_without_length)
     except OSError as error:
@@ -206,6 +230,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"无法启动 {HOST}:{PORT}：{error}") from error
 
     print(f"逐风扩展商店 Demo：{url}")
+    if ip := lan_ip():
+        print(f"局域网访问：  http://{ip}:{PORT}/")
     print(f"插件目录：{args.packages_dir}")
     print("按 Ctrl+C 停止服务。", flush=True)
     if args.open:

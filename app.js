@@ -125,7 +125,11 @@ function render() {
     const upgrade = current && newer(item.version, current.version);
     const row = rows.insertRow();
     const title = row.insertCell();
-    title.textContent = `${item.name} (${item.file})`;
+    title.textContent = item.name;
+    const file = document.createElement('div');
+    file.className = 'file-name';
+    file.textContent = item.file;
+    title.append(file);
     row.insertCell().textContent = item.version;
     row.insertCell().textContent = formatBytes(item.size);
     row.insertCell().textContent = !current ? '未安装' : upgrade ? `已安装 ${current.version}，可升级` :
@@ -155,7 +159,7 @@ async function refresh() {
     } else installed = new Map();
     show(catalog.errors?.length ? `有 ${catalog.errors.length} 个 CRX 无效：${catalog.errors.map(e => e.file + ' (' + e.error + ')').join('，')}` :
       apiReady() ? `已读取 ${packages.length} 个插件。` :
-        `需要修复版逐风浏览器，并以 Demo 商店开关启动。缺少接口：${missingApis().join('、')}`);
+        `缺少接口：${missingApis().join('、')}`);
   } catch (error) { show(`读取目录失败：${error.message}`); }
   finally { setBusy(false); }
 }
@@ -198,7 +202,7 @@ async function checkUpdate(item) {
     progress?.stop();
     if (!['ready', 'permission_required'].includes(result.state))
       throw new Error(result.errorCode || result.state);
-    if (result.version !== item.version) throw new Error('目录版本已变化，请刷新后重试');
+    if (result.version !== item.version) throw new Error('版本已变化，请刷新后重试');
     prepared.set(item.id, item.sha256);
     show(`版本 ${result.version} 已准备好，点击“升级”应用。`);
   } catch (error) { show(`升级准备失败：${error.message}`); }

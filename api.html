@@ -15,8 +15,8 @@
     <h2>运行前提</h2>
     <ol>
       <li>双击 <code>start.command</code>（macOS）或 <code>start.bat</code>（Windows），Linux 运行 <code>./start.sh</code>；把 CRX3 放在 <code>packages/</code>。</li>
-      <li>如需使用安装功能，让逐风浏览器以 <code>--apps-gallery-url=http://127.0.0.1:18731/</code> 启动；可通过 <code>ARUPA_BROWSER</code> 配置一键启动脚本。</li>
-      <li>在地址栏打开 <code>http://127.0.0.1:18731/</code>。只有这个顶层页面能使用下述浏览器接口；普通 Chrome、其他站点或端口不支持。</li>
+      <li>公网 HTTPS 页面使用新版逐风的 <code>chrome.nomadSignedExtensions</code>，仅支持含可信发布签名的包。随机域名不会自动获得 <code>webstorePrivate</code> 权限。</li>
+      <li>本机普通 CRX 安装、升级和取包进度使用 <code>webstorePrivate</code>：让逐风 Test 构建以 <code>--apps-gallery-url=http://127.0.0.1:18731/</code> 启动并打开此地址；可通过 <code>ARUPA_BROWSER</code> 配置启动脚本。普通 Chrome 不支持这些安装接口。</li>
     </ol>
     <p>安装、卸载、应用升级必须由用户点击触发；隐身页面和已失效的标签页会被拒绝。原生确认框不能由网页绕过。</p>
   </section>
@@ -26,12 +26,39 @@
     <table>
       <thead><tr><th>接口</th><th>返回</th><th>用途</th></tr></thead>
       <tbody>
-        <tr><td><code>GET /api/catalog</code></td><td>JSON：<code>packages[]</code>、<code>errors[]</code></td><td>扫描 <code>packages/*.crx</code>；同一插件 ID 只列最高版本。</td></tr>
-        <tr><td><code>GET /api/package?id=&lt;32位插件ID&gt;</code></td><td><code>application/x-chrome-extension</code></td><td>浏览器内部按 ID 取得目录中的当前最高版本 CRX。</td></tr>
+        <tr><td><code>GET /api/catalog?platform=desktop|android</code></td><td>JSON：<code>packages[]</code>、<code>errors[]</code></td><td>扫描 <code>packages/*.crx</code>；先过滤平台，再选同 ID 最高版本。默认 desktop。</td></tr>
+        <tr><td><code>GET /api/package?id=&lt;32位插件ID&gt;&amp;platform=desktop|android&amp;sha256=&lt;摘要&gt;</code></td><td><code>application/x-chrome-extension</code></td><td>按 ID 和平台取包；sha256 可选，提供时必须与当前包一致，否则返回 409。</td></tr>
         <tr><td><code>GET /api/health</code></td><td>JSON：服务状态与标识</td><td>供一键启动脚本识别已运行的 Demo 服务。</td></tr>
       </tbody>
     </table>
-    <p><code>packages[]</code> 每项包括 <code>id</code>、<code>name</code>、<code>version</code>、<code>manifest</code>、<code>sha256</code>、<code>size</code>、<code>file</code> 和 <code>requirements</code>。后者仅提示已扫描到的默认启用规则需求，例如 <code>responseStageRules</code>；它不是浏览器的兼容性或安装校验结果。无效 CRX 在 <code>errors[]</code> 中返回文件名及原因；包接口的 400、404、409 分别表示 ID 无效、未找到、读取时文件已变化。所有 HTTP 接口都不执行安装或卸载。</p>
+    <p><code>packages[]</code> 每项包括 <code>id</code>、<code>name</code>、<code>version</code>、<code>manifest</code>、<code>sha256</code>、<code>size</code>、<code>file</code>、<code>signedProduct</code>、<code>platforms</code> 和 <code>requirements</code>。signedProduct 是包内发布元数据的路由提示，不代表签名已通过验证；platforms 根据 MiVPN 引擎文件区分桌面/Android，通用扩展默认两者。requirements 仅提示已扫描到的默认启用规则需求，例如 <code>responseStageRules</code>；它不是浏览器的兼容性或安装校验结果。无效 CRX 在 <code>errors[]</code> 中返回文件名及原因；包接口的 400、404、409 分别表示参数无效、未找到、摘要不符或读取时文件已变化。所有 HTTP 接口都不执行安装或卸载。</p>
+  </section>
+
+  <section>
+    <h2>公网 HTTPS：发布签名安装</h2>
+    <p>Demo 优先为含发布签名元数据的包选择 <code>chrome.nomadSignedExtensions</code>。页面必须是顶层 HTTPS 页面，取包 URL 必须同源；浏览器匿名取包且不跟随重定向。仅有普通 CRX3 作者签名的包不能走此通道，网页也不能代替发布方签名。</p>
+    <pre><code>// 点击事件内立即调用，不要先 await fetch 或延迟调用。
+const packageUrl = new URL('/api/package', location.origin);
+packageUrl.searchParams.set('id', item.id);
+packageUrl.searchParams.set('platform', 'desktop'); // Android 页面用 android
+packageUrl.searchParams.set('sha256', item.sha256);
+chrome.nomadSignedExtensions.install({
+  extensionId: item.id, packageUrl: packageUrl.href, expectedSha256: item.sha256
+}, result =&gt; {
+  if (chrome.runtime.lastError) return; // 失败/取消均保留原错误
+  // 校验 result.extensionId、product、version 与目录相符，再查 getStatus。
+});
+
+chrome.nomadSignedExtensions.getStatus(item.id, status =&gt; {
+  if (chrome.runtime.lastError) return;
+  // { state: 'absent'|'installed'|'disabled', extensionId, product?, version? }
+});
+
+// 另一次用户点击；浏览器显示原生卸载确认。
+chrome.nomadSignedExtensions.uninstall(item.id, () =&gt; {
+  if (!chrome.runtime.lastError) location.reload();
+});</code></pre>
+    <p>install 回调成功表示整次安装完成，不再调用 completeInstall；Demo 还会重新查询并核对安装状态。此通道目前没有进度查询、checkUpdate 或 applyUpdate，不能复用下述 webstorePrivate 的进度接口；网页显示取包/验签等待提示，出现新版时提示手动卸载后重装。以下章节描述本机目录通道。</p>
   </section>
 
   <section>
@@ -105,7 +132,7 @@ chrome.webstorePrivate.applyUpdate(item.id, applied =&gt; {
     <h2>错误与安全边界</h2>
     <p>浏览器接口的异步错误通过 <code>chrome.runtime.lastError.message</code> 返回；安装预检也可能返回非空结果码。常见原因包括用户取消、当前标签页失效、权限变化、签名或清单不匹配、目录包变化、扩展正在使用。页面应重新读取目录及安装状态后再重试，不能凭按钮状态推断安装成功。</p>
     <p>当浏览器只返回 <code>dnr_package_invalid</code> 时，本站不会把它解释为 CRX 损坏，也不会仅凭目录扫描断定内核缺少哪项能力。页面会保留原始错误码；若目录扫描发现响应头匹配规则，只将其作为排查线索。只有浏览器明确返回 <code>dnr_kernel_capability_unavailable</code> 时，才提示缺少内核能力。</p>
-    <p>本站固定监听 <code>127.0.0.1:18731</code>，不是公网插件市场。它不接受上传，也没有执行安装/升级/卸载的 HTTP 写接口。<code>chrome.webstorePrivate</code> 是逐风浏览器对特定商店页面开放的特权接口，不是普通网页通用 API。</p>
+    <p>本站监听 <code>0.0.0.0:18731</code>，可通过本机、局域网或当前隧道访问。它不接受上传，也没有执行安装/升级/卸载的 HTTP 写接口。<code>chrome.webstorePrivate</code> 仅向特定商店页面开放；公网签名安装由 <code>chrome.nomadSignedExtensions</code> 提供，两者的授权和能力不同。</p>
   </section>
 </body>
 </html>

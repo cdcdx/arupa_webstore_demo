@@ -13,7 +13,7 @@
       <div>
         <p class="eyebrow">LOCAL EXTENSION CATALOG</p>
         <h1>逐风扩展商店 <span>Demo</span></h1>
-        <p class="intro">从本机 <code>packages/</code> 读取 CRX3。签名、权限、安装与升级事务仍由逐风浏览器原生验证。</p>
+        <p class="intro">从本机 <code>packages/</code> 读取 CRX3。公网安装需要新版逐风浏览器和逐风发布签名；普通 CRX 请在本机商店安装。签名和权限由浏览器原生验证。</p>
       </div>
       <a class="secondary-action" href="/docs">查看接口文档</a>
     </header>
@@ -36,7 +36,7 @@
       </div>
     </section>
 
-    <footer>仅监听 <code>127.0.0.1:18731</code>，不连接 Google 商店，也不提供上传接口。</footer>
+    <footer>默认监听 <code>18731</code> 端口并申请随机公网域名，不连接 Google 商店，也不提供上传接口。加 <code>--no-tunnel</code> 可只保留本机/局域网访问。</footer>
   </main>
 </body>
 </html>

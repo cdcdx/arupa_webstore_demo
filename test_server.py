@@ -16,23 +16,79 @@ import server
 
 class LocalCrxCatalogTests(unittest.TestCase):
 
-    def mivpn_catalog_fixture(self, *, metadata=True, signature_size=64, ordinary=False):
+    def mivpn_catalog_fixture(self, *, metadata=True, signature_size=64, ordinary=False,
+                             platform="desktop", version="0.0.27"):
         # Structural catalog fixture only. Signature verification belongs to the browser.
         original = (server.ROOT / "packages" / "nomad-demo-1.0.crx").read_bytes()
         prefix = original[:12 + struct.unpack_from("<I", original, 8)[0]]
-        manifest = {"manifest_version": 3, "name": "MiVPN catalog fixture", "version": "0.0.27",
+        manifest = {"manifest_version": 3, "name": "MiVPN catalog fixture", "version": version,
                     "key": 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzy0BFXToH46UMXZztwgClKb8Xb6WFn2dJtcrwfu+oCZSeZ/9rID8PWarTFUCDqRT5qAjZ6cHKYN5noj4ZjdF4z4iktxkB849CGDyfJMhwmolfXjObGgdAril5oNxvorOaiEByGbzlvR5xHTTWPjQoCLOeBPzJASg0l4NnK/T1QVK9cBRDsUlt0Ch8XEEGy40PUVZJSOG4MrGp/4ct2Wf6cwYVQ92d7lxoyD0HdN75j9O0iIk7XkppjYh2gTNYAI8Gf5kRyc57Pv/7bJDaT/3TlbKo7rPyBtBZytJsnvc7j3FutKNB0ZLuF/ufxWDmrqioZoFCFHPT4/vq9S1JHGgDwIDAQAB'}
         if ordinary:
             manifest.pop("key")
         stream = io.BytesIO()
         with zipfile.ZipFile(stream, "w") as archive:
             archive.writestr("manifest.json", json.dumps(manifest))
+            archive.writestr("engine/classes.dex" if platform == "android" else
+                             "engine/mac-arm64/mivpn-browser.dylib", b"fixture")
             if metadata:
                 archive.writestr("META-INF/mivpn-package.json", json.dumps({
                     "schema": 1, "product": "mivpn", "extensionId": crx_catalog.MIVPN_ID,
                     "version": manifest["version"]}))
                 archive.writestr("META-INF/mivpn-package.sig", bytes(signature_size))
         return prefix + stream.getvalue()
+
+    def test_platform_filter_precedes_version_selection_and_download_is_pinned(self):
+        desktop = self.mivpn_catalog_fixture(version="0.0.34")
+        android = self.mivpn_catalog_fixture(platform="android", version="0.0.48")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "desktop.crx").write_bytes(desktop)
+            (root / "android.crx").write_bytes(android)
+            httpd = server.DemoServer((server.HOST, 0), root)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection(*httpd.server_address)
+            try:
+                for platform, version, raw in (("desktop", "0.0.34", desktop), ("android", "0.0.48", android)):
+                    connection.request("GET", "/api/catalog?platform=" + platform)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    package, = json.loads(response.read())["packages"]
+                    self.assertEqual((package["version"], package["signedProduct"], package["platforms"]),
+                                     (version, "mivpn", [platform]))
+                    route = f'/api/package?id={package["id"]}&platform={platform}&sha256={package["sha256"]}'
+                    connection.request("GET", route)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), raw)
+                    connection.request("GET", route.replace(package["sha256"], "0" * 64))
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 409)
+                    self.assertEqual(response.read(), b"package_changed")
+                for route in ("/api/catalog?platform=ios", "/api/catalog?platform=desktop&platform=android",
+                              f"/api/package?id={crx_catalog.MIVPN_ID}&sha256=invalid"):
+                    connection.request("GET", route)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 400)
+                    response.read()
+            finally:
+                connection.close()
+                httpd.shutdown(); httpd.server_close(); thread.join()
+
+    def test_general_publisher_metadata_is_a_hint_not_a_signature_verdict(self):
+        original = (server.ROOT / "packages" / "nomad-demo-1.0.crx").read_bytes()
+        prefix = original[:12 + struct.unpack_from("<I", original, 8)[0]]
+        manifest = crx_catalog.extract_manifest(original)
+        metadata = {"schema": 1, "product": "demo-addon", "extensionId": crx_catalog.crx_id(original),
+                    "version": manifest["version"]}
+        for signature_size, product in ((64, "demo-addon"), (63, None)):
+            memory = io.BytesIO()
+            with zipfile.ZipFile(memory, "w") as archive:
+                archive.writestr("manifest.json", json.dumps(manifest))
+                archive.writestr("META-INF/nomad-package.json", json.dumps(metadata))
+                archive.writestr("META-INF/nomad-package.sig", bytes(signature_size))
+            self.assertEqual(crx_catalog.signed_package_metadata(prefix + memory.getvalue(), manifest),
+                             (product, ("desktop", "android")))
 
     def test_mivpn_uses_inner_install_id_and_http_preserves_crx_bytes(self):
         raw = self.mivpn_catalog_fixture()

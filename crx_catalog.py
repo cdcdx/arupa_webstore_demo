@@ -37,6 +37,8 @@ class Package:
     sha256: str
     size: int
     requirements: dict
+    signed_product: str | None = None
+    platforms: tuple[str, ...] = ("desktop", "android")
 
     def public(self) -> dict:
         return {
@@ -48,6 +50,8 @@ class Package:
             "size": self.size,
             "file": self.path.name,
             "requirements": self.requirements,
+            "signedProduct": self.signed_product,
+            "platforms": list(self.platforms),
         }
 
 
@@ -244,6 +248,7 @@ def read_package(path: Path) -> Package:
     if len(data) > MAX_PACKAGE_BYTES:
         raise ValueError("package_too_large")
     manifest = extract_manifest(data)
+    signed_product, platforms = signed_package_metadata(data, manifest)
     return Package(
         path=path,
         extension_id=install_id(data, manifest),
@@ -253,16 +258,54 @@ def read_package(path: Path) -> Package:
         sha256=hashlib.sha256(data).hexdigest(),
         size=len(data),
         requirements=active_rule_requirements(data, manifest),
+        signed_product=signed_product,
+        platforms=platforms,
     )
 
 
-def catalog(packages_dir: Path) -> tuple[list[Package], list[dict]]:
+def signed_package_metadata(data: bytes, manifest: dict) -> tuple[str | None, tuple[str, ...]]:
+    """Read routing hints only; the browser authenticates the publishing signature."""
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = set(archive.namelist())
+        stem = next((name for name in ("META-INF/nomad-package", "META-INF/mivpn-package")
+                     if name + ".json" in names), None)
+        if stem is None:
+            return None, ("desktop", "android")
+        try:
+            inventory = archive.getinfo(stem + ".json")
+            signature = archive.getinfo(stem + ".sig")
+            if inventory.file_size > MAX_MANIFEST_BYTES or signature.file_size != 64:
+                return None, ("desktop", "android")
+            metadata = json.loads(archive.read(inventory))
+        except (KeyError, ValueError):
+            return None, ("desktop", "android")
+        product = metadata.get("product") if isinstance(metadata, dict) else None
+        if (not isinstance(product, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", product)
+                or metadata.get("schema") != 1 or metadata.get("version") != manifest["version"]
+                or metadata.get("extensionId") != install_id(data, manifest)):
+            return None, ("desktop", "android")
+        platforms = ("desktop", "android")
+        if product == "mivpn":
+            supported = []
+            if any(name in names for name in ("engine/win-x64/mivpn-browser.dll",
+                    "engine/mac-arm64/mivpn-browser.dylib", "engine/mac-x64/mivpn-browser.dylib",
+                    "engine/linux-x64/libmivpn-browser.so")):
+                supported.append("desktop")
+            if "engine/classes.dex" in names or any(name.startswith("engine/lib/") for name in names):
+                supported.append("android")
+            platforms = tuple(supported)
+        return product, platforms
+
+
+def catalog(packages_dir: Path, platform: str | None = None) -> tuple[list[Package], list[dict]]:
     """Return the newest valid package for every extension ID and parse errors."""
     chosen: dict[str, Package] = {}
     errors = []
     for path in sorted(packages_dir.glob("*.crx")):
         try:
             package = read_package(path)
+            if platform is not None and platform not in package.platforms:
+                continue
             existing = chosen.get(package.extension_id)
             if existing is None or version_parts(package.version) > version_parts(existing.version):
                 chosen[package.extension_id] = package

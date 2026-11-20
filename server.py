@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""HTTP server for the local CRX catalog demo (loopback + LAN)."""
+"""HTTP server for the local CRX catalog demo (loopback, LAN, optional tunnel)."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
+import platform
+import queue
+import re
 import socket
 import subprocess
+import sys
+import tarfile
 import threading
 import time
 import urllib.request
@@ -24,6 +30,9 @@ LOOPBACK = "127.0.0.1"
 PORT = 18731
 ROOT = Path(__file__).resolve().parent
 PACKAGES = ROOT / "packages"
+CLOUDFLARED = ROOT / ".bin" / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
+CLOUDFLARED_RELEASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/docs": ("api.html", "text/html; charset=utf-8"),
@@ -76,22 +85,24 @@ class Handler(BaseHTTPRequestHandler):
             pass  # The browser can cancel the test transfer by closing the page.
 
     def do_GET(self) -> None:
-        expected_port = self.server.server_address[1]
         host_header = self.headers.get("Host", "")
-        # Accept any Host that carries our port (covers localhost, 127.0.0.1,
-        # LAN IPs, and hostnames). Reject if the port is explicitly wrong.
-        if ":" in host_header:
-            try:
-                port = int(host_header.rsplit(":", 1)[1])
-                if port != expected_port:
-                    self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
-                    return
-            except ValueError:
+        hostname, _, port_text = host_header.partition(":")
+        if port_text:
+            if not port_text.isdigit() or int(port_text) != self.server.server_address[1]:
                 self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
                 return
-        if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
+        # Accept loopback, this machine's LAN identity and an active tunnel host;
+        # this keeps the DNS-rebinding guard while allowing remote access.
+        if hostname.lower().rstrip(".") not in ALLOWED_HOSTS:
             self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
             return
+        if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "same-site", "none"):
+            # Allow opening the page from an external link (chat, IM, docs). That is
+            # a top-level document navigation; cross-site subresource requests stay blocked.
+            if not (self.headers.get("Sec-Fetch-Site") == "cross-site"
+                    and self.headers.get("Sec-Fetch-Dest") == "document"):
+                self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
+                return
 
         url = urlsplit(self.path)
         if url.path in ASSETS and not url.query:
@@ -109,8 +120,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(200, body, "application/json; charset=utf-8")
             return
 
-        if url.path == "/api/catalog" and not url.query:
-            packages, errors = catalog(self.server.packages_dir)
+        if url.path == "/api/catalog":
+            platforms = parse_qs(url.query, keep_blank_values=True).get("platform", ["desktop"])
+            if len(platforms) != 1 or platforms[0] not in ("desktop", "android"):
+                self.send_bytes(400, b"invalid_platform", "text/plain; charset=utf-8")
+                return
+            packages, errors = catalog(self.server.packages_dir, platforms[0])
             body = json.dumps(
                 {"packages": [package.public() for package in packages], "errors": errors},
                 ensure_ascii=False,
@@ -119,14 +134,24 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if url.path == "/api/package":
-            ids = parse_qs(url.query, keep_blank_values=True).get("id", [])
+            query = parse_qs(url.query, keep_blank_values=True)
+            ids = query.get("id", [])
             if len(ids) != 1 or not valid_extension_id(ids[0]):
                 self.send_bytes(400, b"invalid_extension_id", "text/plain; charset=utf-8")
                 return
-            packages, _ = catalog(self.server.packages_dir)
+            platforms = query.get("platform", ["desktop"])
+            hashes = query.get("sha256", [])
+            if (len(platforms) != 1 or platforms[0] not in ("desktop", "android")
+                    or hashes and (len(hashes) != 1 or not re.fullmatch(r"[a-f0-9]{64}", hashes[0]))):
+                self.send_bytes(400, b"invalid_package_request", "text/plain; charset=utf-8")
+                return
+            packages, _ = catalog(self.server.packages_dir, platforms[0])
             package = next((item for item in packages if item.extension_id == ids[0]), None)
             if package is None:
                 self.send_bytes(404, b"package_not_found", "text/plain; charset=utf-8")
+                return
+            if hashes and hashes[0] != package.sha256:
+                self.send_bytes(409, b"package_changed", "text/plain; charset=utf-8")
                 return
             try:
                 data = package.path.read_bytes()
@@ -153,6 +178,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--packages-dir", type=Path, default=PACKAGES, help="指定隔离的 CRX 测试目录")
     parser.add_argument("--package-delay-ms", type=int, default=0, help="取包响应及每块包体的延迟，0–5000 毫秒")
     parser.add_argument("--package-without-length", action="store_true", help="CRX 响应省略 Content-Length")
+    parser.add_argument(
+        "--no-tunnel",
+        dest="tunnel",
+        action="store_false",
+        help="只在本机和局域网提供访问，不申请随机公网域名",
+    )
+    parser.add_argument(
+        "--tunnel",
+        dest="tunnel",
+        action="store_true",
+        help="申请随机 trycloudflare.com 域名（默认开启，保留该参数以兼容旧命令）",
+    )
+    parser.set_defaults(tunnel=True)
     parser.add_argument(
         "--browser",
         default=os.environ.get("ARUPA_BROWSER"),
@@ -212,6 +250,125 @@ def lan_ip() -> str | None:
     return None
 
 
+def local_hostnames() -> set[str]:
+    """Hostnames this process is reachable through; tunnels add theirs at runtime."""
+    hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    if ip := lan_ip():
+        hosts.add(ip)
+    hostname = socket.gethostname().lower().rstrip(".")
+    if hostname:
+        hosts.update({hostname, f"{hostname}.local"})
+    return hosts
+
+
+ALLOWED_HOSTS = local_hostnames()
+
+
+def cloudflared_asset() -> str:
+    machine = platform.machine().lower()
+    if sys.platform == "darwin":
+        return "cloudflared-darwin-arm64.tgz" if machine in ("arm64", "aarch64") else "cloudflared-darwin-amd64.tgz"
+    if sys.platform.startswith("linux"):
+        return "cloudflared-linux-arm64" if machine in ("arm64", "aarch64") else "cloudflared-linux-amd64"
+    if sys.platform == "win32":
+        return "cloudflared-windows-amd64.exe" if machine in ("amd64", "x86_64") else "cloudflared-windows-386.exe"
+    raise SystemExit(f"暂不支持在 {sys.platform} 上自动下载 cloudflared，请手动安装后重试。")
+
+
+def ensure_cloudflared() -> Path:
+    """Return the local cloudflared binary, downloading it on first use."""
+    if CLOUDFLARED.is_file():
+        return CLOUDFLARED
+    asset = cloudflared_asset()
+    url = CLOUDFLARED_RELEASE + asset
+    print(f"首次使用随机域名需要下载 cloudflared：{url}", flush=True)
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response:
+            payload = response.read()
+    except OSError as error:
+        raise SystemExit(
+            f"下载 cloudflared 失败：{error}\n可手动下载 {url} 后放到 {CLOUDFLARED}"
+        ) from error
+
+    if asset.endswith(".tgz"):
+        try:
+            with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+                member = archive.extractfile("cloudflared")
+                if member is None:
+                    raise KeyError("cloudflared")
+                payload = member.read()
+        except (KeyError, tarfile.TarError) as error:
+            raise SystemExit("cloudflared 压缩包内容异常，请重试或手动安装。") from error
+
+    CLOUDFLARED.parent.mkdir(exist_ok=True)
+    temporary = CLOUDFLARED.with_name(CLOUDFLARED.name + ".tmp")
+    temporary.write_bytes(payload)
+    temporary.chmod(0o755)
+    temporary.replace(CLOUDFLARED)
+    return CLOUDFLARED
+
+
+TUNNEL_PROCESS: subprocess.Popen[str] | None = None
+
+
+def start_tunnel() -> tuple[subprocess.Popen[str], str]:
+    """Open a Cloudflare quick tunnel and return its process and public URL."""
+    global TUNNEL_PROCESS
+    process = subprocess.Popen(
+        [str(ensure_cloudflared()), "tunnel", "--url", f"http://{LOOPBACK}:{PORT}", "--no-autoupdate"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    TUNNEL_PROCESS = process
+    found: queue.Queue[str | None] = queue.Queue()
+    log: list[str] = []
+
+    def read_output() -> None:
+        for line in process.stdout or []:
+            log.append(line)
+            match = TUNNEL_URL_RE.search(line)
+            if match and found.empty():
+                found.put(match.group(0))
+        found.put(None)
+
+    threading.Thread(target=read_output, daemon=True).start()
+    try:
+        url = found.get(timeout=60)
+    except queue.Empty:
+        process.terminate()
+        raise SystemExit("申请随机域名超时，请检查网络后重试。") from None
+    if url is None:
+        process.terminate()
+        detail = "".join(log[-8:]).strip()
+        raise SystemExit(f"随机域名启动失败。\n{detail}")
+    return process, url
+
+
+def start_tunnel_async() -> None:
+    """Apply for a public URL in the background so local access starts first."""
+
+    def run() -> None:
+        try:
+            _, public_url = start_tunnel()
+        except SystemExit as error:
+            print(f"随机域名不可用，当前仅能本机/局域网访问：{error}", flush=True)
+            return
+        ALLOWED_HOSTS.add(urlsplit(public_url).hostname or "")
+        print(f"随机域名访问：{public_url}/", flush=True)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def stop_tunnel() -> None:
+    process = TUNNEL_PROCESS
+    if process is None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.browser:
@@ -233,7 +390,11 @@ def main(argv: list[str] | None = None) -> None:
     if ip := lan_ip():
         print(f"局域网访问：  http://{ip}:{PORT}/")
     print(f"插件目录：{args.packages_dir}")
+    if args.tunnel:
+        print("正在申请随机域名…（首次运行会下载 cloudflared）", flush=True)
+        start_tunnel_async()
     print("按 Ctrl+C 停止服务。", flush=True)
+
     if args.open:
         threading.Timer(0.2, open_demo, args=(url, args.browser)).start()
     try:
@@ -241,6 +402,7 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         print("\nDemo 服务已停止。")
     finally:
+        stop_tunnel()
         server.server_close()
 
 

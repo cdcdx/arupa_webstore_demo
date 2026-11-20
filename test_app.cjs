@@ -22,7 +22,7 @@ async function page(chrome = {}, items = [signed, ordinary], userAgent = 'Deskto
   const requests = [];
   const context = { document: { querySelector: id => nodes[id], createElement: element },
     window: { chrome, navigator: { userAgent }, location: { origin: 'https://store.example' } },
-    chrome, URL, setTimeout, clearTimeout,
+    chrome, URL, AbortController, setTimeout, clearTimeout,
     fetch: async url => { requests.push(url); return { ok: true, json: async () => ({ packages: items, errors: [] }) }; },
   };
   vm.runInNewContext(source, context);
@@ -33,10 +33,15 @@ async function page(chrome = {}, items = [signed, ordinary], userAgent = 'Deskto
   };
 }
 function signedBrowser(options = {}) {
-  let current = { extensionId: signed.id, state: 'absent' };
+  let current = options.initialStatus || { extensionId: signed.id, state: 'absent' };
   const calls = [];
   const chrome = { runtime: {}, nomadSignedExtensions: {
-    getStatus(id, cb) { calls.push(['getStatus', id]); cb(options.badStatus ? {} : current); },
+    getStatus(id, cb) {
+      calls.push(['getStatus', id]);
+      const reply = current.state === 'installed' && options.postStatus ? { ...current, ...options.postStatus } : current;
+      cb(options.badStatus || options.badPostStatus && current.state === 'installed' ? {} :
+        options.omitMetadata ? { extensionId: current.extensionId, state: current.state } : reply);
+    },
     install(details, cb) {
       calls.push(['install', details]);
       if (options.error) {
@@ -56,7 +61,8 @@ function signedBrowser(options = {}) {
   assert.equal(unsupported.buttons(0).length, 0);
   assert.equal(unsupported.buttons(1).length, 0);
   assert.match(unsupported.actions(0).textContent, /新版逐风/);
-  assert.match(unsupported.actions(1).textContent, /普通 CRX/);
+  assert.equal(unsupported.actions(1).textContent, '无签名');
+  assert.equal(unsupported.nodes['#packages'].children[0].children[3].textContent, '无法读取');
 
   const browser = signedBrowser();
   const publicPage = await page(browser.chrome);
@@ -91,9 +97,52 @@ function signedBrowser(options = {}) {
   const invalid = await page(signedBrowser({ badReceipt: true }).chrome);
   await invalid.context.install(signed);
   assert.match(invalid.status(), /回执与所选插件不一致/);
+  const unconfirmed = await page(signedBrowser({ badPostStatus: true }).chrome);
+  await unconfirmed.context.install(signed);
+  assert.match(unconfirmed.status(), /浏览器已完成安装，但安装状态未确认/);
   const badStatus = await page(signedBrowser({ badStatus: true }).chrome);
   assert.equal(badStatus.buttons(0).length, 0);
   assert.match(badStatus.status(), /安装状态读取失败/);
+
+  // StatusResult metadata is optional, and the installed product may differ
+  // from the current catalog's signed product without making the reply invalid.
+  for (const metadata of [{}, { product: null, version: null }, { product: 'older-product', version: '0.9' }]) {
+    const fixture = signedBrowser({ initialStatus: { extensionId: signed.id, state: 'installed', ...metadata } });
+    const installedPage = await page(fixture.chrome, [signed]);
+    assert.equal(installedPage.buttons(0)[0].textContent, '卸载');
+    assert.doesNotMatch(installedPage.status(), /失败|无效/);
+    const state = installedPage.nodes['#packages'].children[0].children[3].textContent;
+    assert.match(state, metadata.version ? /已安装 0.9/ : /已安装（版本未知）/);
+  }
+  const optional = await page(signedBrowser({ omitMetadata: true }).chrome, [signed]);
+  await optional.context.install(signed);
+  assert.equal(optional.status(), '安装成功。');
+  await optional.context.refresh();
+  assert.equal(optional.buttons(0)[0].textContent, '卸载');
+  await optional.context.uninstall(signed);
+  assert.equal(optional.status(), '卸载成功。');
+
+  const disabled = await page(signedBrowser({ initialStatus: {
+    extensionId: signed.id, state: 'disabled', version: signed.version,
+  } }).chrome, [signed]);
+  assert.match(disabled.nodes['#packages'].children[0].children[3].textContent, /已停用/);
+  assert.equal(disabled.buttons(0)[0].textContent, '卸载');
+
+  for (const [reply, expected] of [
+    [{ extensionId: ordinary.id, state: 'installed' }, /插件 ID 不一致/],
+    [{ extensionId: signed.id, state: 'unknown' }, /未知安装状态/],
+    [{ extensionId: signed.id, state: 'installed', version: 42 }, /version 字段类型无效/],
+  ]) {
+    const malformed = await page(signedBrowser({ initialStatus: reply }).chrome, [signed]);
+    assert.equal(malformed.buttons(0).length, 0);
+    assert.match(malformed.nodes['#packages'].children[0].children[3].textContent, expected);
+  }
+  for (const postStatus of [{ product: 'different-product' }, { version: '2.0' }]) {
+    const mismatch = await page(signedBrowser({ postStatus }).chrome, [signed]);
+    await mismatch.context.install(signed);
+    assert.match(mismatch.status(), /安装状态未确认/);
+    assert.doesNotMatch(mismatch.status(), /安装成功/);
+  }
 
   const mobileBrowser = signedBrowser();
   const mobile = await page(mobileBrowser.chrome, [signed], 'Mozilla/5.0 Android');
@@ -113,6 +162,54 @@ function signedBrowser(options = {}) {
   await localPending;
   assert.equal(legacyCalls[1][0], 'complete');
   assert.equal(local.status(), '安装成功。');
+
+  // A failed refresh must not leave stale actionable buttons behind.
+  const recoveryBrowser = signedBrowser();
+  const recovery = await page(recoveryBrowser.chrome);
+  const originalFetch = recovery.context.fetch;
+  recovery.context.fetch = async () => { throw new Error('service offline'); };
+  assert.equal(await recovery.context.refresh(), false);
+  assert.match(recovery.status(), /读取目录失败/);
+  assert.equal(recovery.buttons(0).length, 0);
+  await recovery.context.install(signed);
+  assert.equal(recoveryBrowser.calls.filter(call => call[0] === 'install').length, 0);
+  recovery.context.fetch = originalFetch;
+  await recovery.context.refresh();
+  assert.equal(recovery.buttons(0)[0].textContent, '安装');
+
+  // Refresh cannot unlock the UI during an unresolved native installation.
+  let confirm;
+  recoveryBrowser.chrome.nomadSignedExtensions.install = (details, callback) => { confirm = callback; };
+  const inFlight = recovery.context.install(signed);
+  const requestCount = recovery.requests.length;
+  assert.equal(await recovery.context.refresh(), false);
+  assert.equal(recovery.requests.length, requestCount);
+  assert.equal(recovery.buttons(0)[0].disabled, true);
+  recoveryBrowser.chrome.runtime.lastError = { message: 'signed_extension_confirmation_cancelled' };
+  confirm();
+  delete recoveryBrowser.chrome.runtime.lastError;
+  await inFlight;
+  assert.equal(recovery.buttons(0)[0].disabled, false);
+
+  // One unavailable API namespace must not disable the independent signed route.
+  const partialBrowser = signedBrowser();
+  partialBrowser.chrome.webstorePrivate = legacy.webstorePrivate;
+  partialBrowser.chrome.management = { getAll() { throw new Error('legacy unavailable'); } };
+  const partial = await page(partialBrowser.chrome);
+  assert.equal(partial.buttons(0)[0].textContent, '安装');
+  assert.equal(partial.buttons(1).length, 0);
+  partialBrowser.chrome.management = { getAll: callback => callback([{ id: signed.id, type: 'extension', version: '1.0', enabled: true }]) };
+  await partial.context.refresh();
+  assert.equal(partial.buttons(0).length, 0);
+  assert.match(partial.nodes['#packages'].children[0].children[3].textContent, /其他通道安装/);
+
+  const unchangedBrowser = signedBrowser();
+  const unchanged = await page(unchangedBrowser.chrome);
+  await unchanged.context.install(signed);
+  unchangedBrowser.chrome.nomadSignedExtensions.uninstall = (id, callback) => callback();
+  await unchanged.context.uninstall(signed);
+  assert.match(unchanged.status(), /尚未确认插件已移除/);
+  assert.equal(unchanged.buttons(0)[0].textContent, '卸载');
 
   const context = local.context;
   const adguard = { requirements: { responseStageRules: 5 } };

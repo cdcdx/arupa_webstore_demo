@@ -3,8 +3,8 @@ setlocal
 cd /d "%~dp0"
 where py >nul 2>nul
 if %errorlevel% equ 0 (
-  py -3 server.py --open %*
+  py -3 storectl.py %*
 ) else (
-  python server.py --open %*
+  python storectl.py %*
 )
 if errorlevel 1 pause

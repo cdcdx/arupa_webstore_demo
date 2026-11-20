@@ -5,16 +5,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
 import json
 import os
-import platform
-import queue
 import re
+import secrets
+import signal
 import socket
 import subprocess
-import sys
-import tarfile
 import threading
 import time
 import urllib.request
@@ -24,15 +21,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from crx_catalog import catalog, valid_extension_id
+from local_tunnel import LocalTunnel
 
 HOST = "0.0.0.0"
 LOOPBACK = "127.0.0.1"
 PORT = 18731
 ROOT = Path(__file__).resolve().parent
 PACKAGES = ROOT / "packages"
-CLOUDFLARED = ROOT / ".bin" / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
-CLOUDFLARED_RELEASE = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
-TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/docs": ("api.html", "text/html; charset=utf-8"),
@@ -41,30 +37,70 @@ ASSETS = {
 }
 
 
+def lan_ip() -> str | None:
+    """Best-effort lookup of this machine's LAN IPv4 address."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            # Connect to an external address so the kernel picks the right NIC.
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    return None
+
+
+def local_hostnames() -> set[str]:
+    """Hostnames this process is reachable through; tunnels add theirs at runtime."""
+    hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    if ip := lan_ip():
+        hosts.add(ip)
+    hostname = socket.gethostname().lower().rstrip(".")
+    if hostname:
+        hosts.update({hostname, f"{hostname}.local"})
+    return hosts
+
+
 class DemoServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
     def __init__(self, server_address: tuple[str, int], packages_dir: Path,
-                 package_delay: float = 0, package_without_length: bool = False):
+                 package_delay: float = 0, package_without_length: bool = False,
+                 control_token: str | None = None, instance_id: str | None = None):
         self.packages_dir = packages_dir
         self.package_delay = package_delay
         self.package_without_length = package_without_length
+        self.control_token = control_token
+        self.instance_id = instance_id or secrets.token_hex(16)
+        self.stopping = threading.Event()
+        self.allowed_hosts = local_hostnames()
+        self.tunnel: LocalTunnel | None = None
         super().__init__(server_address, Handler)
+
+    def runtime(self) -> dict:
+        port = self.server_address[1]
+        lan = lan_ip()
+        tunnel = self.tunnel.snapshot() if self.tunnel else {"state": "disabled", "publicUrl": None, "error": None}
+        return {
+            "service": "arupa-webstore-demo",
+            "instanceId": self.instance_id,
+            "localUrl": f"http://{LOOPBACK}:{port}/",
+            "lanUrl": f"http://{lan}:{port}/" if lan else None,
+            "tunnel": tunnel,
+        }
 
 
 class Handler(BaseHTTPRequestHandler):
     server: DemoServer
 
-    def send_bytes(self, code: int, body: bytes, content_type: str) -> None:
+    def send_headers(self, code: int, content_type: str, length: int) -> None:
         package = content_type == "application/x-chrome-extension"
-        delay = self.server.package_delay if package else 0
-        if delay:
-            time.sleep(delay)
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         if not package or not self.server.package_without_length:
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header(
@@ -73,6 +109,9 @@ class Handler(BaseHTTPRequestHandler):
             "style-src 'self'; object-src 'none'; frame-ancestors 'none'",
         )
         self.end_headers()
+
+    def send_bytes(self, code: int, body: bytes, content_type: str, delay: float = 0) -> None:
+        self.send_headers(code, content_type, len(body))
         if not delay:
             self.wfile.write(body)
             return
@@ -84,24 +123,35 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # The browser can cancel the test transfer by closing the page.
 
-    def do_GET(self) -> None:
+    def host_allowed(self) -> bool:
         host_header = self.headers.get("Host", "")
         hostname, _, port_text = host_header.partition(":")
         if port_text:
             if not port_text.isdigit() or int(port_text) != self.server.server_address[1]:
-                self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
-                return
+                return False
         # Accept loopback, this machine's LAN identity and an active tunnel host;
         # this keeps the DNS-rebinding guard while allowing remote access.
-        if hostname.lower().rstrip(".") not in ALLOWED_HOSTS:
-            self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
+        return hostname.lower().rstrip(".") in self.server.allowed_hosts
+
+    def loopback_request(self) -> bool:
+        host = self.headers.get("Host", "").partition(":")[0].lower()
+        return (host in LOOPBACK_HOSTS
+                and self.headers.get("Origin") is None
+                and self.headers.get("Sec-Fetch-Site") is None)
+
+    def forbidden(self) -> None:
+        self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
+
+    def do_GET(self) -> None:
+        if not self.host_allowed():
+            self.forbidden()
             return
         if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "same-site", "none"):
             # Allow opening the page from an external link (chat, IM, docs). That is
             # a top-level document navigation; cross-site subresource requests stay blocked.
             if not (self.headers.get("Sec-Fetch-Site") == "cross-site"
                     and self.headers.get("Sec-Fetch-Dest") == "document"):
-                self.send_bytes(403, b"forbidden", "text/plain; charset=utf-8")
+                self.forbidden()
                 return
 
         url = urlsplit(self.path)
@@ -117,6 +167,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if url.path == "/api/health" and not url.query:
             body = json.dumps({"status": "ok", "service": "arupa-webstore-demo"}).encode()
+            self.send_bytes(200, body, "application/json; charset=utf-8")
+            return
+
+        if url.path == "/api/runtime" and not url.query:
+            body = json.dumps(self.server.runtime(), ensure_ascii=False).encode()
             self.send_bytes(200, body, "application/json; charset=utf-8")
             return
 
@@ -160,24 +215,46 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, ValueError):
                 self.send_bytes(409, b"package_changed", "text/plain; charset=utf-8")
                 return
-            self.send_bytes(200, data, "application/x-chrome-extension")
+            self.send_bytes(200, data, "application/x-chrome-extension", self.server.package_delay)
             return
 
         self.send_bytes(404, b"not_found", "text/plain; charset=utf-8")
 
+    def do_POST(self) -> None:
+        if urlsplit(self.path).path != "/_control/stop":
+            self.send_bytes(404, b"not_found", "text/plain; charset=utf-8")
+            return
+        token = self.server.control_token
+        supplied = self.headers.get("X-Store-Control-Token", "")
+        if not token or not self.loopback_request() or not secrets.compare_digest(supplied, token):
+            self.forbidden()
+            return
+        self.server.stopping.set()
+        body = json.dumps({"instanceId": self.server.instance_id}).encode()
+        self.send_bytes(200, body, "application/json; charset=utf-8")
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
 
 def create_server(packages_dir: Path = PACKAGES, package_delay: float = 0,
-                  package_without_length: bool = False) -> DemoServer:
+                  package_without_length: bool = False, port: int = PORT,
+                  control_token: str | None = None, instance_id: str | None = None) -> DemoServer:
     packages_dir.mkdir(exist_ok=True)
-    return DemoServer((HOST, PORT), packages_dir, package_delay, package_without_length)
+    return DemoServer((HOST, port), packages_dir, package_delay, package_without_length,
+                      control_token=control_token, instance_id=instance_id)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None, defaults: dict | None = None) -> argparse.Namespace:
+    defaults = defaults or {}
     parser = argparse.ArgumentParser(description="启动逐风扩展商店本地 Demo")
     parser.add_argument("--open", action="store_true", help="启动后在默认浏览器中打开 Demo 页面")
-    parser.add_argument("--packages-dir", type=Path, default=PACKAGES, help="指定隔离的 CRX 测试目录")
-    parser.add_argument("--package-delay-ms", type=int, default=0, help="取包响应及每块包体的延迟，0–5000 毫秒")
-    parser.add_argument("--package-without-length", action="store_true", help="CRX 响应省略 Content-Length")
+    parser.add_argument("--port", type=int, default=defaults.get("port", PORT), help="监听端口，默认 18731")
+    parser.add_argument("--packages-dir", type=Path, default=Path(defaults.get("packages_dir", PACKAGES)),
+                        help="指定隔离的 CRX 测试目录")
+    parser.add_argument("--package-delay-ms", type=int, default=defaults.get("package_delay_ms", 0),
+                        help="取包响应及每块包体的延迟，0–5000 毫秒")
+    parser.add_argument("--package-without-length", action="store_true",
+                        default=defaults.get("package_without_length", False),
+                        help="CRX 响应省略 Content-Length")
     parser.add_argument(
         "--no-tunnel",
         dest="tunnel",
@@ -190,15 +267,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="申请随机 trycloudflare.com 域名（默认开启，保留该参数以兼容旧命令）",
     )
-    parser.set_defaults(tunnel=True)
+    parser.set_defaults(tunnel=defaults.get("tunnel", True))
     parser.add_argument(
         "--browser",
-        default=os.environ.get("ARUPA_BROWSER"),
+        default=defaults.get("browser", os.environ.get("ARUPA_BROWSER")),
         help="逐风浏览器可执行文件；也可通过 ARUPA_BROWSER 环境变量设置",
     )
     args = parser.parse_args(argv)
     if not 0 <= args.package_delay_ms <= 5000:
         parser.error("--package-delay-ms 必须为 0–5000")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port 必须为 1–65535")
     return args
 
 
@@ -236,175 +315,58 @@ def open_demo(url: str, browser: str | None) -> None:
         webbrowser.open(url)
 
 
-def lan_ip() -> str | None:
-    """Best-effort lookup of this machine's LAN IPv4 address."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            # Connect to an external address so the kernel picks the right NIC.
-            sock.connect(("8.8.8.8", 80))
-            ip = sock.getsockname()[0]
-        if ip and not ip.startswith("127."):
-            return ip
-    except OSError:
-        pass
-    return None
-
-
-def local_hostnames() -> set[str]:
-    """Hostnames this process is reachable through; tunnels add theirs at runtime."""
-    hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-    if ip := lan_ip():
-        hosts.add(ip)
-    hostname = socket.gethostname().lower().rstrip(".")
-    if hostname:
-        hosts.update({hostname, f"{hostname}.local"})
-    return hosts
-
-
-ALLOWED_HOSTS = local_hostnames()
-
-
-def cloudflared_asset() -> str:
-    machine = platform.machine().lower()
-    if sys.platform == "darwin":
-        return "cloudflared-darwin-arm64.tgz" if machine in ("arm64", "aarch64") else "cloudflared-darwin-amd64.tgz"
-    if sys.platform.startswith("linux"):
-        return "cloudflared-linux-arm64" if machine in ("arm64", "aarch64") else "cloudflared-linux-amd64"
-    if sys.platform == "win32":
-        return "cloudflared-windows-amd64.exe" if machine in ("amd64", "x86_64") else "cloudflared-windows-386.exe"
-    raise SystemExit(f"暂不支持在 {sys.platform} 上自动下载 cloudflared，请手动安装后重试。")
-
-
-def ensure_cloudflared() -> Path:
-    """Return the local cloudflared binary, downloading it on first use."""
-    if CLOUDFLARED.is_file():
-        return CLOUDFLARED
-    asset = cloudflared_asset()
-    url = CLOUDFLARED_RELEASE + asset
-    print(f"首次使用随机域名需要下载 cloudflared：{url}", flush=True)
-    try:
-        with urllib.request.urlopen(url, timeout=120) as response:
-            payload = response.read()
-    except OSError as error:
-        raise SystemExit(
-            f"下载 cloudflared 失败：{error}\n可手动下载 {url} 后放到 {CLOUDFLARED}"
-        ) from error
-
-    if asset.endswith(".tgz"):
-        try:
-            with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
-                member = archive.extractfile("cloudflared")
-                if member is None:
-                    raise KeyError("cloudflared")
-                payload = member.read()
-        except (KeyError, tarfile.TarError) as error:
-            raise SystemExit("cloudflared 压缩包内容异常，请重试或手动安装。") from error
-
-    CLOUDFLARED.parent.mkdir(exist_ok=True)
-    temporary = CLOUDFLARED.with_name(CLOUDFLARED.name + ".tmp")
-    temporary.write_bytes(payload)
-    temporary.chmod(0o755)
-    temporary.replace(CLOUDFLARED)
-    return CLOUDFLARED
-
-
-TUNNEL_PROCESS: subprocess.Popen[str] | None = None
-
-
-def start_tunnel() -> tuple[subprocess.Popen[str], str]:
-    """Open a Cloudflare quick tunnel and return its process and public URL."""
-    global TUNNEL_PROCESS
-    process = subprocess.Popen(
-        [str(ensure_cloudflared()), "tunnel", "--url", f"http://{LOOPBACK}:{PORT}", "--no-autoupdate"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-    )
-    TUNNEL_PROCESS = process
-    found: queue.Queue[str | None] = queue.Queue()
-    log: list[str] = []
-
-    def read_output() -> None:
-        for line in process.stdout or []:
-            log.append(line)
-            match = TUNNEL_URL_RE.search(line)
-            if match and found.empty():
-                found.put(match.group(0))
-        found.put(None)
-
-    threading.Thread(target=read_output, daemon=True).start()
-    try:
-        url = found.get(timeout=60)
-    except queue.Empty:
-        process.terminate()
-        raise SystemExit("申请随机域名超时，请检查网络后重试。") from None
-    if url is None:
-        process.terminate()
-        detail = "".join(log[-8:]).strip()
-        raise SystemExit(f"随机域名启动失败。\n{detail}")
-    return process, url
-
-
-def start_tunnel_async() -> None:
-    """Apply for a public URL in the background so local access starts first."""
-
-    def run() -> None:
-        try:
-            _, public_url = start_tunnel()
-        except SystemExit as error:
-            print(f"随机域名不可用，当前仅能本机/局域网访问：{error}", flush=True)
-            return
-        ALLOWED_HOSTS.add(urlsplit(public_url).hostname or "")
-        print(f"随机域名访问：{public_url}/", flush=True)
-
-    threading.Thread(target=run, daemon=True).start()
-
-
-def stop_tunnel() -> None:
-    process = TUNNEL_PROCESS
-    if process is None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-
-
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.browser:
         browser_path = Path(args.browser).expanduser().resolve()
         if not browser_path.is_file():
             raise SystemExit(f"逐风浏览器不存在：{browser_path}")
         args.browser = str(browser_path)
-    url = f"http://{LOOPBACK}:{PORT}/"
+    url = f"http://{LOOPBACK}:{args.port}/"
+    allowed_hosts = local_hostnames()
+    tunnel = LocalTunnel(f"http://{LOOPBACK}:{args.port}", args.tunnel, allowed_hosts)
     try:
-        server = create_server(args.packages_dir, args.package_delay_ms / 1000, args.package_without_length)
+        server = create_server(args.packages_dir, args.package_delay_ms / 1000, args.package_without_length,
+                               port=args.port,
+                               control_token=os.environ.get("ARUPA_STORE_CONTROL_TOKEN") or None,
+                               instance_id=os.environ.get("ARUPA_STORE_INSTANCE_ID") or None)
     except OSError as error:
         if args.open and demo_is_running(url):
             print(f"Demo 服务已在运行，正在打开：{url}")
             open_demo(url, args.browser)
-            return
-        raise SystemExit(f"无法启动 {HOST}:{PORT}：{error}") from error
+            return 0
+        raise SystemExit(f"无法启动 {HOST}:{args.port}：{error}") from error
+    server.allowed_hosts = allowed_hosts
+    server.tunnel = tunnel
 
-    print(f"逐风扩展商店 Demo：{url}")
+    print(f"逐风扩展商店 Demo：{url}", flush=True)
     if ip := lan_ip():
-        print(f"局域网访问：  http://{ip}:{PORT}/")
+        print(f"局域网访问：  http://{ip}:{args.port}/", flush=True)
     print(f"插件目录：{args.packages_dir}")
     if args.tunnel:
         print("正在申请随机域名…（首次运行会下载 cloudflared）", flush=True)
-        start_tunnel_async()
+    else:
+        print("已关闭随机域名。", flush=True)
+    tunnel.start()
     print("按 Ctrl+C 停止服务。", flush=True)
 
+    def handle_stop(_signum: int | None = None, _frame: object | None = None) -> None:
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handle_stop)
     if args.open:
         threading.Timer(0.2, open_demo, args=(url, args.browser)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nDemo 服务已停止。")
+        pass
     finally:
-        stop_tunnel()
+        tunnel.stop()
         server.server_close()
+    print("\nDemo 服务已停止。")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

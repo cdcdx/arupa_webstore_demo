@@ -14,6 +14,7 @@ import io
 import json
 import re
 import struct
+import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -297,18 +298,45 @@ def signed_package_metadata(data: bytes, manifest: dict) -> tuple[str | None, tu
         return product, platforms
 
 
+class CatalogIndex:
+    """Cache parsed metadata, never package bytes; stat every file on each lookup."""
+
+    def __init__(self, packages_dir: Path):
+        self.packages_dir = packages_dir
+        self._entries: dict[Path, tuple[tuple, Package | dict]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, platform: str | None = None) -> tuple[list[Package], list[dict]]:
+        with self._lock:
+            chosen: dict[str, Package] = {}
+            errors = []
+            entries = {}
+            for path in sorted(self.packages_dir.glob("*.crx")):
+                try:
+                    stat = path.stat()
+                    stamp = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                    cached = self._entries.get(path)
+                    if cached and cached[0] == stamp:
+                        value = cached[1]
+                    else:
+                        try:
+                            value = read_package(path)
+                        except (OSError, ValueError, zipfile.BadZipFile) as error:
+                            value = {"file": path.name, "error": str(error)}
+                    entries[path] = (stamp, value)
+                    if isinstance(value, dict):
+                        errors.append(value)
+                        continue
+                    if platform is not None and platform not in value.platforms:
+                        continue
+                    existing = chosen.get(value.extension_id)
+                    if existing is None or version_parts(value.version) > version_parts(existing.version):
+                        chosen[value.extension_id] = value
+                except OSError as error:
+                    errors.append({"file": path.name, "error": str(error)})
+            self._entries = entries
+            return sorted(chosen.values(), key=lambda item: (item.name.casefold(), item.extension_id)), errors
+
+
 def catalog(packages_dir: Path, platform: str | None = None) -> tuple[list[Package], list[dict]]:
-    """Return the newest valid package for every extension ID and parse errors."""
-    chosen: dict[str, Package] = {}
-    errors = []
-    for path in sorted(packages_dir.glob("*.crx")):
-        try:
-            package = read_package(path)
-            if platform is not None and platform not in package.platforms:
-                continue
-            existing = chosen.get(package.extension_id)
-            if existing is None or version_parts(package.version) > version_parts(existing.version):
-                chosen[package.extension_id] = package
-        except (OSError, ValueError) as error:
-            errors.append({"file": path.name, "error": str(error)})
-    return sorted(chosen.values(), key=lambda package: (package.name.casefold(), package.extension_id)), errors
+    return CatalogIndex(packages_dir).get(platform)

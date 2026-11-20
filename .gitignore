@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .bin/
+.runtime/
 .trae-html-share-packages/
 

@@ -11,16 +11,16 @@ import re
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import threading
-import time
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from crx_catalog import catalog, valid_extension_id
+from crx_catalog import CatalogIndex, Package, valid_extension_id
 from local_tunnel import LocalTunnel
 
 HOST = "0.0.0.0"
@@ -28,6 +28,7 @@ LOOPBACK = "127.0.0.1"
 PORT = 18731
 ROOT = Path(__file__).resolve().parent
 PACKAGES = ROOT / "packages"
+PACKAGE_CHUNK_BYTES = 64 * 1024
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 ASSETS = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -70,6 +71,7 @@ class DemoServer(ThreadingHTTPServer):
                  package_delay: float = 0, package_without_length: bool = False,
                  control_token: str | None = None, instance_id: str | None = None):
         self.packages_dir = packages_dir
+        self.catalog = CatalogIndex(packages_dir)
         self.package_delay = package_delay
         self.package_without_length = package_without_length
         self.control_token = control_token
@@ -110,18 +112,66 @@ class Handler(BaseHTTPRequestHandler):
         )
         self.end_headers()
 
-    def send_bytes(self, code: int, body: bytes, content_type: str, delay: float = 0) -> None:
+    def send_bytes(self, code: int, body: bytes, content_type: str) -> None:
         self.send_headers(code, content_type, len(body))
-        if not delay:
-            self.wfile.write(body)
-            return
-        chunk_size = max(1, (len(body) + 7) // 8)
+        self.wfile.write(body)
+
+    def send_package(self, package: Package) -> None:
+        source = None
         try:
-            for offset in range(0, len(body), chunk_size):
-                time.sleep(delay)
-                self.wfile.write(body[offset:offset + chunk_size])
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # The browser can cancel the test transfer by closing the page.
+            if package.path.is_symlink():
+                raise ValueError("package_changed")
+            source = package.path.open("rb")
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size != package.size:
+                raise ValueError("package_changed")
+            digest = hashlib.sha256()
+            remaining = package.size
+            while remaining:
+                chunk = source.read(min(PACKAGE_CHUNK_BYTES, remaining))
+                if not chunk:
+                    raise ValueError("package_changed")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(source.fileno())
+            if (source.read(1) or digest.hexdigest() != package.sha256
+                    or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                    != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                raise ValueError("package_changed")
+            source.seek(0)
+        except (OSError, ValueError):
+            if source is not None:
+                source.close()
+            self.send_bytes(409, b"package_changed", "text/plain; charset=utf-8")
+            return
+
+        with source:
+            self.send_headers(200, "application/x-chrome-extension", package.size)
+            interval = max(1, (package.size + 7) // 8)
+            chunk_size = min(PACKAGE_CHUNK_BYTES, interval) if self.server.package_delay else PACKAGE_CHUNK_BYTES
+            sent, next_pause = 0, 0
+            try:
+                while sent < package.size:
+                    if self.server.package_delay and sent >= next_pause:
+                        if self.server.stopping.wait(self.server.package_delay):
+                            self.close_connection = True
+                            return
+                        next_pause += interval
+                    # A replaced pathname does not change this open file. In-place
+                    # writes are unsupported; stop a changed/truncated response.
+                    current = os.fstat(source.fileno())
+                    if (current.st_size, current.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                        self.close_connection = True
+                        return
+                    chunk = source.read(min(chunk_size, package.size - sent))
+                    if not chunk:
+                        self.close_connection = True
+                        return
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    sent += len(chunk)
+            except OSError:
+                self.close_connection = True  # A closed/cancelled download owns no lasting server resources.
 
     def host_allowed(self) -> bool:
         host_header = self.headers.get("Host", "")
@@ -180,7 +230,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(platforms) != 1 or platforms[0] not in ("desktop", "android"):
                 self.send_bytes(400, b"invalid_platform", "text/plain; charset=utf-8")
                 return
-            packages, errors = catalog(self.server.packages_dir, platforms[0])
+            packages, errors = self.server.catalog.get(platforms[0])
             body = json.dumps(
                 {"packages": [package.public() for package in packages], "errors": errors},
                 ensure_ascii=False,
@@ -200,7 +250,7 @@ class Handler(BaseHTTPRequestHandler):
                     or hashes and (len(hashes) != 1 or not re.fullmatch(r"[a-f0-9]{64}", hashes[0]))):
                 self.send_bytes(400, b"invalid_package_request", "text/plain; charset=utf-8")
                 return
-            packages, _ = catalog(self.server.packages_dir, platforms[0])
+            packages, _ = self.server.catalog.get(platforms[0])
             package = next((item for item in packages if item.extension_id == ids[0]), None)
             if package is None:
                 self.send_bytes(404, b"package_not_found", "text/plain; charset=utf-8")
@@ -208,14 +258,7 @@ class Handler(BaseHTTPRequestHandler):
             if hashes and hashes[0] != package.sha256:
                 self.send_bytes(409, b"package_changed", "text/plain; charset=utf-8")
                 return
-            try:
-                data = package.path.read_bytes()
-                if len(data) != package.size or hashlib.sha256(data).hexdigest() != package.sha256:
-                    raise ValueError("package_changed")
-            except (OSError, ValueError):
-                self.send_bytes(409, b"package_changed", "text/plain; charset=utf-8")
-                return
-            self.send_bytes(200, data, "application/x-chrome-extension", self.server.package_delay)
+            self.send_package(package)
             return
 
         self.send_bytes(404, b"not_found", "text/plain; charset=utf-8")

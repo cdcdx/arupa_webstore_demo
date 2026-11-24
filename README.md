@@ -2,6 +2,8 @@
 
 一个零依赖的 CRX3 扩展目录：默认在本机启动，同时申请随机公网域名，外网设备也能访问。它负责展示 `packages/` 中的扩展包；签名、权限、DNR 规则以及安装/升级事务仍由逐风浏览器的原生安装器验证。
 
+完整的分层架构、两条安装链路、进度协议、HTTP 接口、更新与卸载、部署排查及源码索引见 [逐风扩展商店 Demo 技术文档](docs/逐风扩展商店Demo技术文档.md)。当前已复用服务级目录缓存，并从经过摘要校验的同一文件句柄流式取包；MiVPN 平台按包内引擎筛选。
+
 ## 一键启动
 
 项目只要求 Python 3.9 或更高版本，不需要安装第三方依赖。
@@ -52,7 +54,7 @@ python3 server.py
 python3 server.py --no-tunnel
 ```
 
-start/restart 支持 `--packages-dir`、`--package-delay-ms`、`--package-without-length`、`--no-package-without-length`、`--tunnel`、`--no-tunnel`、`--browser`、`--no-open`。`--port` 和 `--runtime-dir` 可用于隔离测试实例；本机 `webstorePrivate` 安装仍应使用默认端口 18731。
+start/restart 支持 `--packages-dir`、`--package-delay-ms`、`--package-without-length`、`--tunnel`、`--no-tunnel`、`--browser`、`--no-open`。`--port` 和 `--runtime-dir` 可用于隔离测试实例；本机 `webstorePrivate` 安装仍应使用默认端口 18731。当前没有 `--no-package-without-length` 反向参数。
 
 默认浏览器可以查看目录，但安装、卸载和升级按钮需要包含本 Demo 改动的逐风浏览器。要让一键脚本直接启动逐风浏览器，可先设置其可执行文件路径：
 
@@ -60,7 +62,7 @@ start/restart 支持 `--packages-dir`、`--package-delay-ms`、`--package-withou
 ./start.sh --browser "/path/to/arupa-browser"
 ```
 
-`--browser` 也接受 macOS `.app` 路径。首次启动可用 `ARUPA_BROWSER` 环境变量提供默认值；之后保存已选设置。启动器会自动传入 `--apps-gallery-url=http://127.0.0.1:18731/` 并打开 Demo 页面。也可以前台执行：
+`--browser` 当前需要可执行文件路径；macOS 应填写 `.app/Contents/MacOS/NomadBrowser`，不能直接填写 `.app` 目录。首次启动可用 `ARUPA_BROWSER` 环境变量提供默认值；之后保存已选设置。启动器会自动传入 `--apps-gallery-url=http://127.0.0.1:18731/` 并打开 Demo 页面。也可以前台执行：
 
 ```bash
 python3 server.py --open
@@ -93,7 +95,7 @@ python3 server.py --open --browser /path/to/arupa-browser
 
 签名通道目前也没有 `checkUpdate` 接口。已安装签名扩展出现新版时，页面提示手动卸载后重装，不自动卸载。
 
-目录与下载均按 `platform=desktop|android` 选包（默认 desktop）。MiVPN 依据包内实际引擎区分平台，先过滤平台再选同 ID 的最高版本，避免把 Android 0.0.48 送到桌面端而漏掉桌面 0.0.34。通用签名扩展默认列在两个平台，最终兼容性由浏览器校验。
+目录与下载均按 `platform=desktop|android` 选包（默认 desktop），先过滤平台再选同 ID 最高版本。MiVPN 兼容旧元数据、`mivpn` 与 `mivpn-*` 产品名，并依据实际包含的桌面引擎、Android DEX/原生库判断支持的平台；包含这些引擎的自定义产品名也适用。iOS-only 或没有对应引擎的 MiVPN 包不列入桌面/Android 目录。普通通用扩展默认列在两端。平台元数据只是路由提示，最终兼容性由浏览器校验。
 
 ### 本机目录通道
 
@@ -107,8 +109,8 @@ python3 server.py --open --browser /path/to/arupa-browser
 ## 项目结构
 
 ```text
-crx_catalog.py  CRX3 身份、版本、平台与按文件变化失效的元数据缓存
-server.py       HTTP 路由、Host 校验、流式取包、本机控制与运行状态
+crx_catalog.py  CRX3 身份、版本、引擎平台与按文件变化失效的元数据索引
+server.py       HTTP 路由、共享目录索引、文件流式取包、本机控制与运行状态
 local_tunnel.py 隧道启动、连接状态、退出检测与清理
 storectl.py     跨平台启停、配置保存、实例校验与并发锁
 app.js          浏览器特权 API 调用与页面状态管理
@@ -120,15 +122,15 @@ packages/       当前对外展示的 CRX3
 samples/        不直接展示的升级示例
 ```
 
-目录按文件的 inode、大小和修改时间等信息缓存解析结果，文件替换或删除后自动失效。取包使用同一打开的文件先核对大小和 SHA-256，再分块发送，避免反复解析目录以及把完整大包长期保留在内存中。
+每个 HTTP 服务实例持有同一个 `CatalogIndex`，目录与下载请求复用解析结果；文件替换、修改、删除后失效，无效包也会在变化后重新检查。首次解析包仍会整包读入，缓存只保存元数据。取包先以不超过 64 KiB 的读取校验大小和 SHA-256，再回退同一打开文件并分块发送，不再把完整包体加载到发送缓冲。发布文件应使用临时文件加原子替换，已打开的下载保持原文件；检测到原地改写或截断时中止响应。限速约在八段包体位置等待，避免大包因每个 64 KiB 块都延迟而超时；未知大小模式仍省略 Content-Length。
 
-服务不接受上传，没有安装、升级或卸载的 HTTP 写接口。唯一生命周期写接口 `POST /_control/stop` 仅接受回环客户端、回环 Host、本机控制凭据，且拒绝网页 Origin / Sec-Fetch-Site；它不向公网或局域网页面提供停止功能。Host 端口校验和 `Sec-Fetch-Site` 检查继续约束只读请求。
+服务不接受上传，没有安装、升级或卸载的 HTTP 写接口。唯一生命周期写接口 `POST /_control/stop` 要求回环 Host、本机控制凭据，且拒绝网页 Origin / Sec-Fetch-Site；当前没有额外检查 TCP 客户端地址。Host 端口校验和 `Sec-Fetch-Site` 检查继续约束只读请求。
 
 页面安装、卸载和升级互斥执行。目录请求或浏览器状态读取有超时；目录失败时保留旧列表供查看，但关闭操作入口，刷新成功后恢复。安装/卸载原生结果回调没有被网页超时替代，成功后仍重新读取状态。公网签名通道与本机目录通道保持各自的能力边界。
 
 目录对大小受限的默认启用 DNR 规则做只读扫描，只提供响应头匹配相关的排查线索。扫描结果不能代替浏览器内核校验；只有浏览器明确返回 `dnr_kernel_capability_unavailable` 时，页面才提示能力缺失。
 
-完整的 HTTP 与浏览器接口说明见启动后的 [接口文档](http://127.0.0.1:18731/docs)。
+完整的 HTTP 与浏览器接口说明见启动后的 [接口文档](http://127.0.0.1:18731/docs)，包括参数与返回字段、两条安装通道、UUID 进度查询、错误处理和可复制的前端示例。文档提供章节导航，并适配手机宽度。
 
 ## 桌面 / Android 商店方案
 

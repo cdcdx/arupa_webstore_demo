@@ -286,15 +286,18 @@ def signed_package_metadata(data: bytes, manifest: dict) -> tuple[str | None, tu
                 or metadata.get("extensionId") != install_id(data, manifest)):
             return None, ("desktop", "android")
         platforms = ("desktop", "android")
-        if product == "mivpn":
-            supported = []
-            if any(name in names for name in ("engine/win-x64/mivpn-browser.dll",
-                    "engine/mac-arm64/mivpn-browser.dylib", "engine/mac-x64/mivpn-browser.dylib",
-                    "engine/linux-x64/libmivpn-browser.so")):
-                supported.append("desktop")
-            if "engine/classes.dex" in names or any(name.startswith("engine/lib/") for name in names):
-                supported.append("android")
-            platforms = tuple(supported)
+        files = {item.filename for item in archive.infolist() if not item.is_dir() and item.file_size > 0}
+        desktop = bool(files.intersection({"engine/win-x64/mivpn-browser.dll",
+            "engine/mac-arm64/mivpn-browser.dylib", "engine/mac-x64/mivpn-browser.dylib",
+            "engine/linux-x64/libmivpn-browser.so"}))
+        android = "engine/classes.dex" in files or any(
+            name.startswith("engine/lib/") and name.endswith(".so") for name in files)
+        # Product names are metadata, not an authentication or platform boundary.
+        # Recognize the legacy format and renamed products, including iOS-only
+        # packages with no supported desktop/Android engine. Engine-bearing
+        # packages also work with an independently named publishing product.
+        if stem == "META-INF/mivpn-package" or product == "mivpn" or product.startswith("mivpn-") or desktop or android:
+            platforms = tuple(platform for platform, supported in (("desktop", desktop), ("android", android)) if supported)
         return product, platforms
 
 
@@ -313,14 +316,18 @@ class CatalogIndex:
             entries = {}
             for path in sorted(self.packages_dir.glob("*.crx")):
                 try:
-                    stat = path.stat()
-                    stamp = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                    info = path.lstat()
+                    stamp = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
                     cached = self._entries.get(path)
                     if cached and cached[0] == stamp:
                         value = cached[1]
                     else:
                         try:
                             value = read_package(path)
+                            after = path.lstat()
+                            if stamp != (after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                                         after.st_mtime_ns, after.st_ctime_ns):
+                                raise ValueError("package_changed")
                         except (OSError, ValueError, zipfile.BadZipFile) as error:
                             value = {"file": path.name, "error": str(error)}
                     entries[path] = (stamp, value)

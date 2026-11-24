@@ -1,186 +1,428 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>接口文档 · 逐风扩展商店 Demo</title>
-  <link rel="stylesheet" href="/style.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="逐风扩展商店 Demo 的 HTTP、签名安装、本机目录安装、进度查询、升级与卸载接口，以及前端接入示例。">
+<title>接口文档 · 逐风扩展商店 Demo</title>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body class="docs-page">
-  <p><a href="/">← 返回插件列表</a></p>
-  <h1>安装、升级、卸载接口文档</h1>
-  <p>本站仅提供目录和 CRX 文件；网页不能直接修改浏览器的插件目录。安装、升级、卸载通过逐风浏览器在本站授权的 <code>chrome.*</code> 接口完成，并由原生安装器校验和确认。整个流程不查询 Google 商店。</p>
+<div class="docs-layout">
+<aside class="docs-sidebar"><a class="docs-back" href="/">← 返回商店</a><nav class="docs-nav" aria-label="接口文档目录"><strong>接口目录</strong><a href="#overview">选择通道</a>
+<a href="#http-api">网站 HTTP</a>
+<a href="#signed-api">签名安装 API</a>
+<a href="#catalog-api">本机目录 API</a>
+<a href="#progress">进度与生命周期</a>
+<a href="#examples">完整接入示例</a>
+<a href="#errors">结果与错误</a>
+<a href="#compatibility">版本排查</a>
+<a href="#operations">启停联调</a>
+<a href="#verification">验收清单</a>
+</nav></aside>
+<main class="docs-main">
+<header class="docs-header"><p class="eyebrow">逐风扩展商店 Demo</p><h1>安装与进度接口文档</h1>
+<p class="docs-meta">更新于 2026-11-24 · HTTP 协议与浏览器网页接口</p>
+<p>网站提供目录和 CRX，浏览器负责下载、验证、权限确认与安装事务。本文给前端提供参数、返回值、错误语义和可复制示例；两条安装通道分别说明。整个 Demo 安装流程不查询 Google 商店。</p>
+<p class="doc-callout">前端最小路径：提前读取目录 → 用户点击调用原生安装 → 独立查询进度 → 由原回调判定结果 → 重新读取安装状态。</p></header>
+<section id="overview" aria-labelledby="overview-heading"><h2 id="overview-heading">选择安装通道</h2>
 
-  <section>
-    <h2>运行前提</h2>
-    <ol>
-      <li>双击 <code>start.command</code>（macOS）或 <code>start.bat</code>（Windows），Linux 运行 <code>./start.sh</code>；把 CRX3 放在 <code>packages/</code>。</li>
-      <li>公网 HTTPS 页面使用新版逐风的 <code>chrome.nomadSignedExtensions</code>，仅支持含可信发布签名的包。随机域名不会自动获得 <code>webstorePrivate</code> 权限。</li>
-      <li>本机普通 CRX 安装、升级和取包进度使用 <code>webstorePrivate</code>：让逐风 Test 构建以 <code>--apps-gallery-url=http://127.0.0.1:18731/</code> 启动并打开此地址；可通过 <code>ARUPA_BROWSER</code> 配置启动脚本。普通 Chrome 不支持这些安装接口。</li>
-    </ol>
-    <p>安装、卸载、应用升级必须由用户点击触发；隐身页面和已失效的标签页会被拒绝。原生确认框不能由网页绕过。</p>
-  </section>
+<p>先读取目录，再按包的 <code>signedProduct</code> 和目标浏览器实际提供的方法选择通道。签名安装回调只返回最终结果，下载和阶段通过独立的 <code>getOperationProgress</code> 查询。</p>
+<div class="table-wrap"><table><thead><tr><th scope="col">项目</th><th scope="col">发布签名安装</th><th scope="col">本机目录安装</th></tr></thead><tbody>
+<tr><td>新装入口</td><td><code>nomadSignedExtensions.install</code></td><td><code>webstorePrivate.beginInstallWithManifest3</code> → <code>completeInstall</code></td></tr>
+<tr><td>允许的页面</td><td>生产：顶层 HTTPS；Test：额外允许 RFC1918 IPv4 HTTP，任意端口</td><td>配套逐风启动器：HTTP 18731，127.0.0.1 或 RFC1918 IPv4；Production / Test / Development 均适用</td></tr>
+<tr><td>包与信任</td><td>CRX3 加受信 Ed25519 发布签名、MV3、资源和身份验证</td><td>CRX3 作者签名、MV3、ID、manifest 预览、权限与 DNR；MiVPN 另做准入检查</td></tr>
+<tr><td>状态 / 卸载</td><td><code>getStatus</code> / <code>uninstall</code></td><td><code>management.getAll</code> / <code>management.uninstall</code></td></tr>
+<tr><td>进度 / 更新</td><td>同命名空间 getter；无网页 checkUpdate / applyUpdate</td><td>目录 getter；checkUpdate / applyUpdate 可单独检测</td></tr>
+</tbody></table></div><p class="doc-callout">随机公网域名只提供网络访问，不授予 webstorePrivate 权限。目录通道不接受 localhost、IPv6、其他 127/8 地址或其他端口。签名 Test HTTP 也不接受 loopback；普通 Chrome 没有逐风的安装能力。安装、卸载及应用更新需要真实用户点击，iframe、Worker、无痕或失效文档不可用。</p>
+</section>
 
-  <section>
-    <h2>网站 HTTP 接口（只读）</h2>
-    <table>
-      <thead><tr><th>接口</th><th>返回</th><th>用途</th></tr></thead>
-      <tbody>
-        <tr><td><code>GET /api/catalog?platform=desktop|android</code></td><td>JSON：<code>packages[]</code>、<code>errors[]</code></td><td>扫描 <code>packages/*.crx</code>；先过滤平台，再选同 ID 最高版本。默认 desktop。</td></tr>
-        <tr><td><code>GET /api/package?id=&lt;32位插件ID&gt;&amp;platform=desktop|android&amp;sha256=&lt;摘要&gt;</code></td><td><code>application/x-chrome-extension</code></td><td>按 ID 和平台取包；sha256 可选，提供时必须与当前包一致，否则返回 409。</td></tr>
-        <tr><td><code>GET /api/health</code></td><td>JSON：服务状态与标识</td><td>供一键启动脚本识别已运行的 Demo 服务。</td></tr>
-        <tr><td><code>GET /api/runtime</code></td><td>实例 ID、运行状态、本机/局域网 URL、隧道 state / publicUrl / error</td><td>供 start.* status 和页面显示当前地址；不返回控制凭据或包目录路径。</td></tr>
-      </tbody>
-    </table>
-    <p><code>packages[]</code> 每项包括 <code>id</code>、<code>name</code>、<code>version</code>、<code>manifest</code>、<code>sha256</code>、<code>size</code>、<code>file</code>、<code>signedProduct</code>、<code>platforms</code> 和 <code>requirements</code>。signedProduct 是包内发布元数据的路由提示，不代表签名已通过验证；platforms 根据 MiVPN 引擎文件区分桌面/Android，通用扩展默认两者。requirements 仅提示已扫描到的默认启用规则需求，例如 <code>responseStageRules</code>；它不是浏览器的兼容性或安装校验结果。无效 CRX 在 <code>errors[]</code> 中返回文件名及原因；包接口的 400、404、409 分别表示参数无效、未找到、摘要不符或读取时文件已变化。所有 HTTP 接口都不执行安装或卸载。</p>
-  </section>
-
-  <section>
-    <h2>商店启停</h2>
-    <p>命令入口统一为 start.sh、start.command、start.bat。不带参数时启动并打开页面；追加 <code>status</code> 查看地址与日志，追加 <code>restart</code> 重启，追加 <code>stop</code> 同时停止服务和隧道。例如 <code>./start.sh status</code>、<code>start.bat stop</code>。重启沿用保存的设置，额外参数覆盖对应值；使用 <code>--no-open</code> 可不打开浏览器。公网域名在真正重启后变化，重复启动保持域名。</p>
-    <p>运行记录位于 .runtime/。仅启停脚本通过带私有凭据的回环请求调用 <code>POST /_control/stop</code>；网页不能使用该控制接口。旧版或手动运行的前台实例请在原终端停止，脚本不会终止未知进程。</p>
-  </section>
-
-  <section>
-    <h2>公网 HTTPS：发布签名安装</h2>
-    <p>Demo 优先为含发布签名元数据的包选择 <code>chrome.nomadSignedExtensions</code>。页面必须是顶层 HTTPS 页面，取包 URL 必须同源；浏览器匿名取包且不跟随重定向。仅有普通 CRX3 作者签名的包不能走此通道，网页也不能代替发布方签名。</p>
-    <pre><code>// 点击事件内立即调用，不要先 await fetch 或延迟调用。
-const packageUrl = new URL('/api/package', location.origin);
-const api = chrome.nomadSignedExtensions;
-const operationId = typeof api.getOperationProgress === 'function'
-  ? crypto.randomUUID() : null; // 兼容旧版
-packageUrl.searchParams.set('id', item.id);
-packageUrl.searchParams.set('platform', 'desktop'); // Android 页面用 android
-packageUrl.searchParams.set('sha256', item.sha256);
-chrome.nomadSignedExtensions.install({
-  extensionId: item.id, packageUrl: packageUrl.href, expectedSha256: item.sha256,
-  ...(operationId &amp;&amp; { operationId })
-}, result =&gt; {
-  if (chrome.runtime.lastError) return; // 失败/取消均保留原错误
-  // 校验 result.extensionId、product、version 与目录相符，再查 getStatus。
-});
-
-chrome.nomadSignedExtensions.getStatus(item.id, status =&gt; {
-  if (chrome.runtime.lastError) return;
-  // { state: 'absent'|'installed'|'disabled', extensionId, product?, version? }
-});
-
-// 另一次用户点击；浏览器显示原生卸载确认。
-chrome.nomadSignedExtensions.uninstall(item.id, () =&gt; {
-  if (!chrome.runtime.lastError) location.reload();
-});</code></pre>
-    <p><code>getStatus</code> 的 product、version 是可选信息，描述当前已安装的扩展，不要求等于商店当前包的元数据。页面严格核对 extensionId 和 state；缺少版本时显示“已安装（版本未知）”并暂停版本比较。install 的成功回执仍须与本次所选包的 ID、产品和版本一致。</p>
-    <p>install 回调成功表示整次安装完成，不再调用 completeInstall；Demo 还会重新查询并核对安装状态。新版增加可选 operationId 和独立进度查询，getStatus 仍只查询安装状态。签名通道没有 checkUpdate 或 applyUpdate；出现新版时提示手动卸载后重装。</p>
-  </section>
-
-  <section>
-    <h2>签名通道：查询真实安装进度</h2>
-    <p>阶段条在安装前保持可见，开始安装时自动滚动到进度区。浏览器缺少查询接口时会明确提示；局域网 HTTP 测试页缺少 crypto.randomUUID 时，Demo 使用 crypto.getRandomValues 生成 UUID v4。查询报错会展示原因，并继续等待原安装回调。</p>
-    <p>商店页面以“下载 → 校验 → 安装”展示阶段。取包对应下载，校验与兼容性检查对应校验，权限确认及后续写入对应安装；权限窗口期间明确显示“等待浏览器权限确认”。百分比仅用于下载，不用固定百分比模拟校验或安装。旧版浏览器没有查询接口时只显示等待提示，最终成功、失败、取消仍由原回调决定。</p>
-    <pre><code>// install 发出后轮询，建议间隔 300 毫秒；最终回调到达后停止。
-chrome.nomadSignedExtensions.getOperationProgress(operationId, result =&gt; {
-  if (chrome.runtime.lastError) return; // 查询失败不代表安装失败
-  const p = result?.progress;
-  if (!p || p.operationId !== operationId || p.extensionId !== item.id) return;
-  if (p.stage === 'downloading') {
-    if (p.totalBytes &gt; 0) {
-      const downloadPercent = Math.min(100, Math.floor(100 * p.receivedBytes / p.totalBytes));
-      // 只表示下载百分比；没有 totalBytes 时显示已接收字节和不定进度。
-    }
-  } else {
-    // 按 p.stage 显示阶段，不能把下载 100% 当作安装成功。
+<section id="http-api" aria-labelledby="http-api-heading"><h2 id="http-api-heading">网站 HTTP 接口</h2>
+<p>以下接口只读，不执行安装。无效请求返回 HTTP 状态和 <code>text/plain</code> 错误码；成功的目录、存活和运行状态返回 JSON。</p><div class="table-wrap"><table><thead><tr><th scope="col">方法与路径</th><th scope="col">参数</th><th scope="col">响应</th></tr></thead><tbody>
+<tr><td><code>GET /api/catalog</code></td><td>platform 可选，desktop 或 android，默认 desktop；重复或空 platform 非法</td><td>200：<code>{packages: Package[], errors: CatalogError[]}</code>；400：invalid_platform</td></tr>
+<tr><td><code>GET /api/package</code></td><td>id 必填，32 位 a–p；platform 可选，默认 desktop；sha256 可选，64 位小写十六进制</td><td>200：CRX 字节；400：invalid_extension_id / invalid_package_request；404：package_not_found；409：package_changed</td></tr>
+<tr><td><code>GET /api/health</code></td><td>无参数</td><td>200：<code>{status: "ok", service: "arupa-webstore-demo"}</code></td></tr>
+<tr><td><code>GET /api/runtime</code></td><td>无参数</td><td>200：service、instanceId、localUrl、lanUrl、tunnel</td></tr>
+<tr><td><code>GET /</code>、<code>GET /docs</code></td><td>无参数；仅前端 hash 锚点不影响路径</td><td>商店页 / 本接口说明；未知路径 404 not_found</td></tr>
+</tbody></table></div><h3>Package 与目录错误</h3><div class="table-wrap"><table><thead><tr><th scope="col">字段</th><th scope="col">类型</th><th scope="col">含义</th></tr></thead><tbody>
+<tr><td>id / name / version</td><td>string</td><td>扩展安装 ID、已解析显示名称、Chromium 数字版本</td></tr>
+<tr><td>manifest</td><td>object</td><td>包内 MV3 清单；目录通道按此预览与实际包比较</td></tr>
+<tr><td>sha256 / size / file</td><td>string / number / string</td><td>完整 CRX 的 SHA-256、字节数、原文件名；size ≤ 128 MiB</td></tr>
+<tr><td>signedProduct</td><td>string 或 null</td><td>发布清单元数据提示，不是已验签结论</td></tr>
+<tr><td>platforms</td><td>string[]</td><td>目录路由平台；MiVPN 按实际引擎过滤后再选同 ID 最高版本</td></tr>
+<tr><td>requirements</td><td>object</td><td>可含 responseStageRules；缺失不证明无相关规则，存在也不等于兼容性判定</td></tr>
+<tr><td>errors[]</td><td><code>{file: string, error: string}[]</code></td><td>无效 CRX 的文件名和原因；其他有效包继续返回</td></tr>
+</tbody></table></div><p>MiVPN 旧格式、mivpn 与 mivpn-* 产品按引擎判定平台；含对应引擎的自定义产品名同样适用。iOS-only 包不进入 desktop/android 目录，普通通用扩展默认两端。只扫描 packages 第一层 *.crx，目录和下载复用服务级缓存，文件变化后重新解析。</p><pre><code id="example-http" data-language="shell">curl &#x27;http://127.0.0.1:18731/api/catalog?platform=desktop&#x27;
+# 将 ID 和摘要替换为上一条目录响应的值；不直接用 file 字段拼路径。
+curl -f &#x27;http://127.0.0.1:18731/api/package?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;platform=desktop&amp;sha256=目录返回的摘要&#x27; -o extension.crx</code></pre><h3>取包与网络约束</h3><p>包响应类型为 <code>application/x-chrome-extension</code>。服务先以不超过 64 KiB 的读取校验摘要，再从同一打开文件分块发送。原子替换不会切换已打开的下载；发送前检测到变化返回 409，发送中发现原地改写或截断会中止连接。不要把部分包体当作下载完成。</p><p>响应使用 no-store、nosniff 和同源 CSP。Host/端口及跨站子资源请求受限制，403 返回 forbidden；未开放跨域 CORS。页面、health、runtime 和静态资源不接受 query 参数。CRX 可省略 Content-Length，因此下载必须支持未知总大小。</p><h3>运行地址结构</h3><pre><code id="example-runtime" data-language="json">{
+  &quot;service&quot;: &quot;arupa-webstore-demo&quot;,
+  &quot;instanceId&quot;: &quot;服务实例标识&quot;,
+  &quot;localUrl&quot;: &quot;http://127.0.0.1:18731/&quot;,
+  &quot;lanUrl&quot;: null,
+  &quot;tunnel&quot;: {
+    &quot;state&quot;: &quot;starting&quot;,
+    &quot;publicUrl&quot;: null,
+    &quot;error&quot;: null
   }
-});</code></pre>
-    <p>返回结构为 <code>{ progress?: { operationId, operation: 'install', extensionId, stage, receivedBytes, totalBytes?, errorCode? } }</code>。阶段依次可能出现 preparing、downloading、verifying、preflight、opening_confirmation、awaiting_user_confirmation、installing、committing；需要回滚时为 rolling_back，终态为 completed、failed 或 cancelled。轮询可能跳过短暂阶段。下载数据来自宿主实际读取的字节，总大小未知时不提供 totalBytes。最终结果仍以 install 回调和 runtime.lastError 为准。</p>
-    <p>operationId 必须是每次新建的非零 UUID。任务同时绑定 Profile、来源和发起文档，查询不需要用户激活；跨来源、其他标签页、刷新后的文档和已清理任务返回空对象。隐身或失效文档被拒绝。终态最多保留两分钟，缓存最多 128 条，容量不足时提前清除旧终态；不持久化。旧版没有此方法时不要传 operationId，继续等待 install 回调。进度查询失败时停止轮询并保留原安装等待流程。</p>
-  </section>
+}</code></pre><p>lanUrl、publicUrl、error 可为 null。隧道状态为 starting、ready、disabled、failed、stopped；只在 ready 时使用 publicUrl，失败后移除旧链接。建议每五秒刷新地址；关闭隧道不影响本机服务。runtime 不含控制 token 或包目录。</p>
+</section>
 
-  <section>
-    <h2>Demo 百分比与标签进度的来源</h2>
-    <table>
-      <thead><tr><th>显示或调用</th><th>实际数据来源</th><th>与签名 install 的关系</th></tr></thead>
-      <tbody>
-        <tr><td>Demo 中“正在下载 CRX · … · xx%”</td><td>签名通道用 <code>nomadSignedExtensions.getOperationProgress</code>；本机普通目录通道用 <code>webstorePrivate.getOperationProgress</code>。</td><td>按实际通道查询 receivedBytes / totalBytes；下载 100% 后继续显示校验和安装阶段。</td></tr>
-        <tr><td>浏览器顶部或标签的页面加载进度</td><td>浏览器的页面导航加载事件。</td><td>不是 CRX 字节进度，不能据此判断插件已下载、校验或安装完成。</td></tr>
-        <tr><td>独立业务安装页的任务进度</td><td>该页面自己的任务协议或阶段展示。例如 AI 搜片安装页适配 <code>window.nomad.installation.onProgress / list</code>。</td><td>是另一份接口合同，须确认目标版本是否提供；本 Demo 尚未接入这一协议。</td></tr>
-        <tr><td><code>nomadSignedExtensions.install</code> 回调</td><td>本次安装的最终结果或 runtime.lastError。</td><td>进度使用新增的 getOperationProgress 单独轮询；getStatus 是安装状态查询。</td></tr>
-      </tbody>
-    </table>
-    <p>Demo 根据包元数据和页面中实际可用的 API 选择安装通道。公网/本机地址、CRX 文件名、进度条外观或标签标题，都不能单独证明具体调用了哪条接口。以下章节描述 webstorePrivate 目录通道。</p>
-  </section>
+<section id="signed-api" aria-labelledby="signed-api-heading"><h2 id="signed-api-heading">发布签名浏览器 API</h2>
+<p>命名空间 <code>chrome.nomadSignedExtensions</code>。install / uninstall 必须直接在点击处理函数中调用，不在它们之前 await 网络请求。callback 内读取 runtime.lastError，回调外该值可能已经被清除。</p><div class="table-wrap"><table><thead><tr><th scope="col">方法</th><th scope="col">参数</th><th scope="col">成功返回 / 语义</th></tr></thead><tbody>
+<tr><td><code>install(details, callback)</code></td><td>InstallDetails，见下表</td><td><code>{extensionId, product, version}</code>；表示整次安装提交完成，不再调用 completeInstall</td></tr>
+<tr><td><code>getStatus(extensionId, callback)</code></td><td>32 位扩展 ID</td><td><code>{extensionId, state, product?, version?}</code>；state 为 absent / installed / disabled</td></tr>
+<tr><td><code>uninstall(extensionId, callback)</code></td><td>32 位扩展 ID；用户点击</td><td>无结果值；原生确认通过后移除；取消走 lastError</td></tr>
+<tr><td><code>getOperationProgress(operationId, callback)</code></td><td>每次新建的非零 UUID；同一发起文档</td><td><code>{progress?}</code>；不需要额外点击，详见进度协议</td></tr>
+</tbody></table></div><h3>InstallDetails</h3><div class="table-wrap"><table><thead><tr><th scope="col">字段</th><th scope="col">必填</th><th scope="col">约束</th></tr></thead><tbody>
+<tr><td>extensionId</td><td>是</td><td>string，32 个 a–p 字符，必须与真实包身份一致</td></tr>
+<tr><td>packageUrl</td><td>是</td><td>string，绝对 URL，必须与页面的 scheme / host / port 同源；无用户名、密码、fragment</td></tr>
+<tr><td>expectedSha256</td><td>否，Demo 必传</td><td>string，64 位十六进制；锁定本次所选 CRX；不能代替受信发布签名</td></tr>
+<tr><td>operationId</td><td>否</td><td>string，36 字符非零 UUID；每次操作新建，不复用；旧版没有 getter 时省略字段</td></tr>
+</tbody></table></div><p>下载为浏览器宿主拥有的匿名请求，不跟随重定向，不复用站点 Cookie 或凭据；仅接受 HTTP 200，最大 128 MiB。宿主默认连接超时 10 秒、下载超时 90 秒，整个操作还有独立生命周期；网页不要用定时器把尚未结束的安装改判为失败。</p><p>状态中的 product、version 为可选字段，Demo 也容忍空值；刷新时不要求它们等于当前商店包。只有本次 install 的成功回执须与所选 ID、product、version 一致。getStatus 只描述签名安装来源中的安装状态，不报告下载进度，也不证明插件业务功能可用。当前签名状态和卸载按 ID / 安装来源筛选，不能据此推断可跨文档读取进度。</p>
+</section>
 
-  <section>
-    <h2>查询安装状态</h2>
-    <pre><code>chrome.management.getAll(items =&gt; {
-  if (chrome.runtime.lastError) throw new Error(chrome.runtime.lastError.message);
-  // 按 id 匹配 catalog.packages；items 中的 version、enabled 用于状态显示。
-});</code></pre>
-    <p>版本大于已安装版本时显示“可升级”；已安装但 <code>enabled === false</code> 时显示“已停用”。</p>
-  </section>
+<section id="catalog-api" aria-labelledby="catalog-api-heading"><h2 id="catalog-api-heading">本机目录浏览器 API</h2>
+<p>命名空间为 <code>chrome.webstorePrivate</code> 与受商店授权的 <code>chrome.management</code>。调用来源须满足目录商店规则；以下只描述本 Demo，Edge 官方商店内部完成提交的兼容分支不适用于此流程。</p><div class="table-wrap"><table><thead><tr><th scope="col">方法</th><th scope="col">参数</th><th scope="col">结果与调用边界</th></tr></thead><tbody>
+<tr><td><code>beginInstallWithManifest3(details, callback)</code></td><td><code>{id, manifest, localizedName?, operationId?}</code>；manifest 是 JSON 字符串</td><td>成功返回空字符串；取包、校验和用户批准已完成，仍须 completeInstall；非空字符串是业务结果码</td></tr>
+<tr><td><code>completeInstall(id, callback)</code></td><td>与前一步相同 ID</td><td>无值且无 lastError 表示提交成功；同 Profile / Origin / Document 的一次性批准，约三分钟有效；无需第二次点击</td></tr>
+<tr><td><code>getOperationProgress(operationId, callback)</code></td><td>36 字符非零 UUID</td><td><code>{progress?}</code>；新装使用 install，检查更新使用 update_check</td></tr>
+<tr><td><code>getExtensionStatus(id, manifest?, callback)</code></td><td>ID；可选 manifest JSON 字符串</td><td>常见返回 enabled / disabled / installable / deprecated_manifest_version；Demo 状态展示主要使用 getAll</td></tr>
+<tr><td><code>management.getAll(callback)</code></td><td>无</td><td>扩展数组；Demo 按 id、type=extension、version、enabled 建立状态表</td></tr>
+<tr><td><code>management.uninstall(id, options, callback)</code></td><td><code>{showConfirmDialog: true}</code>；用户点击</td><td>无值且无 lastError 表示移除；传 false 也不能绕过原生确认</td></tr>
+<tr><td><code>checkUpdate(id, options?, callback)</code></td><td><code>{operationId?}</code>；可保持旧形式 id, callback</td><td><code>{state, version, errorCode}</code>；只准备候选包，不等于已应用</td></tr>
+<tr><td><code>applyUpdate(id, callback)</code></td><td>用户的另一次点击</td><td>boolean；true 才表示已应用。false 可能是取消、延期、候选包变化，不能统一显示成功</td></tr>
+</tbody></table></div><p>manifest 必须与实际包的版本、MV、权限、可选权限、host 权限、内容脚本匹配等关键声明一致；仅替换 localizedName 不改变包身份或授权。beginInstall 的完整 manifest 参数预算为 1,048,576 个字符。宿主固定从当前商店 origin 的 <code>/api/package?id=...</code> 取包，目录更新从 <code>/api/catalog</code> 取候选；网页不能通过 details 指定另一个下载地址。</p><p>历史 127.0.0.1 目录来源保留原管理范围；新增局域网目录来源只枚举、管理和更新自身安装来源。不能根据页面按钮的旧状态推断已安装，目录或状态读取失败后应关闭相关操作，刷新成功再恢复。</p><h3>更新检查状态</h3><div class="table-wrap"><table><thead><tr><th scope="col">state</th><th scope="col">前端处理</th></tr></thead><tbody>
+<tr><td>ready / permission_required</td><td>候选包已准备；核对版本，保存候选 SHA，显示升级按钮；新增权限由 applyUpdate 时再次确认</td></tr>
+<tr><td>up_to_date</td><td>没有更新；不显示为准备失败</td></tr>
+<tr><td>throttled / checking / downloading</td><td>检查被节流或仍在处理；保留提示，不当作安装成功</td></tr>
+<tr><td>unsupported / stale</td><td>来源不支持或安装快照变化；刷新目录和安装状态，再决定是否重新检查</td></tr>
+<tr><td>error / cancelled</td><td>展示 errorCode 或取消结果；恢复按钮，不自动应用</td></tr>
+<tr><td>deferred / applying / updated</td><td>宿主更新状态可能出现；应用成功仍以 applyUpdate=true 与刷新后的状态确认</td></tr>
+</tbody></table></div><p>准备更新验证版本、包大小、SHA-256、DNR 和权限。命中暂存包时可以直接进入校验，未必再出现 downloading。applyUpdate 当前未在 Demo 中接入相同轮询。签名通道没有网页更新接口，Demo 对其新版本提示卸载后重装，不自动卸载。</p>
+</section>
 
-  <section>
-    <h2>安装</h2>
-    <ol>
-      <li>从 <code>/api/catalog</code> 读取所选 CRX 的 <code>id</code>、<code>manifest</code> 和 <code>name</code>。</li>
-      <li>在点击事件中立即调用 <code>beginInstallWithManifest3</code>，等待浏览器验证包和弹出原生授权框。</li>
-      <li>回调结果是空字符串且没有 <code>chrome.runtime.lastError</code> 时，在同一标签页调用 <code>completeInstall</code>；随后重新查询安装状态。</li>
-    </ol>
-    <pre><code>chrome.webstorePrivate.beginInstallWithManifest3({
-  id: item.id,
-  manifest: JSON.stringify(item.manifest),
-  localizedName: item.name
-}, result =&gt; {
-  if (chrome.runtime.lastError || result !== '') return; // 安装未获批准
-  chrome.webstorePrivate.completeInstall(item.id, () =&gt; {
-    if (!chrome.runtime.lastError) location.reload();
+<section id="progress" aria-labelledby="progress-heading"><h2 id="progress-heading">进度字段与生命周期</h2>
+<p>每次操作创建新 UUID，调用原生安装之后才启动查询。每次查询返回后等待约 300 毫秒，避免重叠请求；原结果回调到达时停止。查询失败只关闭进度读取，安装仍等待原回调。当前前端应优先使用 operationId，避免依赖按扩展 ID 查最新任务的候选扩展。</p><pre><code id="example-progress" data-language="json">{
+  &quot;progress&quot;: {
+    &quot;operationId&quot;: &quot;2d43ce42-d24f-4ff5-b879-7966cb93eb73&quot;,
+    &quot;operation&quot;: &quot;install&quot;,
+    &quot;extensionId&quot;: &quot;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&quot;,
+    &quot;stage&quot;: &quot;downloading&quot;,
+    &quot;receivedBytes&quot;: 524288,
+    &quot;totalBytes&quot;: 1048576
+  }
+}</code></pre><div class="table-wrap"><table><thead><tr><th scope="col">字段</th><th scope="col">类型</th><th scope="col">说明</th></tr></thead><tbody>
+<tr><td>operationId / operation / extensionId</td><td>string</td><td>必须同时关联本次任务；operation 为 install 或目录 update_check</td></tr>
+<tr><td>stage</td><td>string</td><td>见下表；轮询可能跳过短暂阶段，未知值显示通用处理中</td></tr>
+<tr><td>receivedBytes</td><td>number</td><td>宿主实际接收的 CRX 包体字节；仅 downloading 计算百分比</td></tr>
+<tr><td>totalBytes</td><td>可选 number</td><td>总大小未知时省略；0 或无效值也按未知处理，不伪造总大小</td></tr>
+<tr><td>errorCode</td><td>可选 string</td><td>部分宿主终态提供；仅用于诊断，最终错误仍读原回调</td></tr>
+</tbody></table></div><div class="table-wrap"><table><thead><tr><th scope="col">stage</th><th scope="col">界面含义</th><th scope="col">三步显示</th></tr></thead><tbody>
+<tr><td>preparing</td><td>准备取包</td><td>下载</td></tr>
+<tr><td>downloading</td><td>下载字节不断增加</td><td>下载</td></tr>
+<tr><td>verifying</td><td>校验摘要、扩展包、签名及规则</td><td>校验</td></tr>
+<tr><td>preflight</td><td>兼容性与权限预检</td><td>校验；旧目录宿主可能仍显示 verifying</td></tr>
+<tr><td>opening_confirmation</td><td>正在创建权限窗口</td><td>安装前准备</td></tr>
+<tr><td>awaiting_user_confirmation</td><td>权限页实际就绪，等待用户决定</td><td>安装前等待</td></tr>
+<tr><td>installing</td><td>正在激活扩展</td><td>安装</td></tr>
+<tr><td>committing</td><td>正在提交安装结果</td><td>安装</td></tr>
+<tr><td>rolling_back</td><td>撤回未完成事务</td><td>等待原结果</td></tr>
+<tr><td>completed</td><td>浏览器已报告完成</td><td>继续核对最终回调和安装状态</td></tr>
+<tr><td>failed / cancelled</td><td>失败或取消终态</td><td>保留原回调语义</td></tr>
+<tr><td>awaiting_install</td><td>较新宿主的可选阶段：批准后等待 completeInstall</td><td>不能当作已安装；旧版可能不返回</td></tr>
+</tbody></table></div><p class="doc-callout">下载 100% 只代表包体接收完成。不要给校验和安装分配固定的 65% / 90%，也不要把标签页导航加载条当作 CRX 进度。总大小未知时显示下载动画和已接收大小；用户取消、失败、成功继续走原回调。</p><div class="table-wrap"><table><thead><tr><th scope="col">查询边界</th><th scope="col">签名安装基线</th><th scope="col">目录通道兼容方式</th></tr></thead><tbody>
+<tr><td>身份隔离</td><td>Profile + Origin + Document + UUID</td><td>相同隔离，包含 install / update_check 的任务类型</td></tr>
+<tr><td>空对象 <code>{}</code></td><td>任务尚未建立、不属于本文档、被清理或过期</td><td>旧宿主在 begin / checkUpdate 回调后也会立即删除；空对象本身不表示失败</td></tr>
+<tr><td>终态保留</td><td>最长两分钟，最多 128 条，必要时提前清理旧终态</td><td>不同宿主版本不同；Demo 为兼容旧版，在 begin 回调后停轮询，再用 completeInstall 的结果</td></tr>
+<tr><td>页面刷新</td><td>新文档不能读取旧任务</td><td>刷新后查安装状态；重新准备更新，不恢复旧 UUID 或 approval</td></tr>
+<tr><td>用户激活</td><td>查询不用额外点击；install/uninstall 需要</td><td>查询与检查更新不用额外点击；新装、卸载、应用更新需要</td></tr>
+</tbody></table></div><p>没有 getter 时省略 operationId，只显示等待提示；有 getter 但宿主未登记时可能返回 host_unavailable。API 方法可见、内核 capability 标志和实际宿主可调用是三个层面，须使用配套构建。版本边界见后文。</p>
+</section>
+
+<section id="examples" aria-labelledby="examples-heading"><h2 id="examples-heading">前端接入示例</h2>
+<p>先复制公共辅助函数，再选择当前通道示例。辅助函数没有依赖 Demo 的 app.js，不新增浏览器接口；它们保留原生点击时机、同次任务关联、未知大小显示和轮询清理。示例结果交给业务 UI 展示，失败后不要无条件自动重装。</p><details><summary>公共辅助函数</summary><pre><code id="example-helpers" data-language="javascript">function callBrowser(api, method, ...args) {
+  return new Promise((resolve, reject) =&gt; {
+    try {
+      api[method](...args, result =&gt; {
+        const error = window.chrome?.runtime?.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve(result);
+      });
+    } catch (error) { reject(error); }
   });
-});</code></pre>
-    <p>浏览器会校验 CRX3 作者签名、插件 ID、实际清单与页面预览一致性、权限及 DNR 规则。授权只绑定当前配置和标签页，且有时效；不能把 <code>completeInstall</code> 当作独立安装接口使用。</p>
-  </section>
+}
 
-  <section>
-    <h2>本机目录通道：查询取包进度</h2>
-    <p>若浏览器提供 <code>chrome.webstorePrivate.getOperationProgress</code>，点击时用 <code>crypto.randomUUID()</code> 生成本次操作的 <code>operationId</code>。新装将它放入 <code>beginInstallWithManifest3</code> 的详情对象，更新检查用 <code>checkUpdate(id, { operationId }, callback)</code>。在原回调完成前，从发起操作的同一页面调用 <code>getOperationProgress(operationId, callback)</code>，建议间隔 300 毫秒。旧浏览器沿用原调用形式。</p>
-    <pre><code>{ progress: { operationId, operation, extensionId, stage, receivedBytes, totalBytes? } }</code></pre>
-    <p><code>operation</code> 为 <code>install</code> 或 <code>update_check</code>。阶段包括 <code>preparing</code>、<code>downloading</code>、<code>verifying</code>。新装还可进入 <code>opening_confirmation</code>、<code>awaiting_user_confirmation</code>。总大小未知时省略 <code>totalBytes</code>；操作尚未开始或已结束时返回 <code>{}</code>。命中更新暂存包时直接校验。安装批准、更新检查结果、错误和取消仍由原回调处理。</p>
-  </section>
+// 仅用于状态和进度读取；安装、卸载、应用升级不用网页超时替代原回调。
+async function readBrowser(api, method, ...args) {
+  let timer;
+  try {
+    return await Promise.race([
+      callBrowser(api, method, ...args),
+      new Promise((_, reject) =&gt; {
+        timer = setTimeout(() =&gt; reject(new Error(&#x27;状态读取超时&#x27;)), 15000);
+      })
+    ]);
+  } finally { clearTimeout(timer); }
+}
 
-  <section>
-    <h2>升级</h2>
-    <ol>
-      <li>把同一作者签名、同一插件 ID 的更高版本 CRX 放入 <code>packages/</code>，刷新列表。</li>
-      <li>点击“准备升级”调用 <code>checkUpdate(id)</code>。只有返回 <code>state: "ready"</code> 或 <code>"permission_required"</code> 且版本与目录一致，页面才显示“升级”。</li>
-      <li>点击“升级”调用 <code>applyUpdate(id)</code>；若新增权限，浏览器会再次请求原生确认。返回 <code>true</code> 后重新查询状态。</li>
-    </ol>
-    <pre><code>// “准备升级”按钮的点击事件：
-chrome.webstorePrivate.checkUpdate(item.id, status =&gt; {
-  if (chrome.runtime.lastError) return;
-  // status: { state, version, errorCode }
-  if (['ready', 'permission_required'].includes(status.state)) {
-    // 页面显示“升级”按钮；不要在此回调中自动调用 applyUpdate。
+function newOperationId() {
+  const crypto = window.crypto;
+  if (typeof crypto?.randomUUID === &#x27;function&#x27;) return crypto.randomUUID();
+  if (typeof crypto?.getRandomValues !== &#x27;function&#x27;) return null;
+  // 局域网 HTTP 通常没有 randomUUID，但仍提供 getRandomValues。
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] &amp; 15) | 64;
+  bytes[8] = (bytes[8] &amp; 63) | 128;
+  const hex = Array.from(bytes, b =&gt; b.toString(16).padStart(2, &#x27;0&#x27;)).join(&#x27;&#x27;);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+// 在原安装调用已经发出后启动；返回停止函数。这是示例 helper，不是浏览器事件 API。
+function watchProgress(api, item, operationId, operation, onProgress = () =&gt; {},
+                       onUnavailable = () =&gt; {}) {
+  if (!operationId || typeof api?.getOperationProgress !== &#x27;function&#x27;) return () =&gt; {};
+  let active = true;
+  let timer = setTimeout(poll, 0);
+  function stop() { active = false; clearTimeout(timer); }
+  async function poll() {
+    try {
+      const result = await readBrowser(api, &#x27;getOperationProgress&#x27;, operationId);
+      if (!active) return;
+      const p = result?.progress;
+      if (p?.operationId === operationId &amp;&amp; p.extensionId === item.id &amp;&amp; p.operation === operation)
+        onProgress(p); // 未知 stage 保留原值，交给界面显示通用等待提示。
+      if (active) timer = setTimeout(poll, 300);
+    } catch (error) {
+      if (active) { stop(); onUnavailable(error); } // 不拒绝原安装 Promise。
+    }
   }
-});
+  return stop;
+}
 
-// “升级”按钮的另一次点击事件（必须保留用户激活）：
-chrome.webstorePrivate.applyUpdate(item.id, applied =&gt; {
-  if (applied &amp;&amp; !chrome.runtime.lastError) location.reload();
-});</code></pre>
-    <p>示例包：先安装 <code>packages/nomad-demo-1.0.crx</code>；再把 <code>samples/nomad-demo-1.1.crx</code> 放进 <code>packages/</code>。浏览器按目录包的版本、大小和 SHA-256 校验升级，不使用 Google 商店的升级队列。</p>
-  </section>
+function progressText(p) {
+  if (p.stage === &#x27;downloading&#x27;) {
+    if (!Number.isFinite(p.receivedBytes) || p.receivedBytes &lt; 0) return &#x27;正在下载，等待字节数据&#x27;;
+    const received = p.receivedBytes.toLocaleString() + &#x27; B&#x27;;
+    if (!Number.isFinite(p.totalBytes) || p.totalBytes &lt;= 0) return &#x27;正在下载，已接收 &#x27; + received;
+    const percent = Math.min(100, Math.floor(p.receivedBytes / p.totalBytes * 100));
+    return `正在下载 ${received} / ${p.totalBytes.toLocaleString()} B · ${percent}%`;
+  }
+  const labels = {
+    preparing: &#x27;准备取包&#x27;, verifying: &#x27;正在校验&#x27;, preflight: &#x27;检查兼容性和权限&#x27;,
+    opening_confirmation: &#x27;正在打开权限窗口&#x27;, awaiting_user_confirmation: &#x27;等待用户确认&#x27;,
+    awaiting_install: &#x27;已获批准，等待提交安装&#x27;, // 较新宿主的可选阶段。
+    installing: &#x27;正在安装&#x27;, committing: &#x27;正在确认安装结果&#x27;, rolling_back: &#x27;正在回滚&#x27;,
+    completed: &#x27;浏览器报告完成，等待核对最终回调&#x27;, failed: &#x27;等待失败结果回调&#x27;,
+    cancelled: &#x27;等待取消结果回调&#x27;
+  };
+  return labels[p.stage] || &#x27;浏览器正在处理&#x27;;
+}
 
-  <section>
-    <h2>卸载</h2>
-    <pre><code>chrome.management.uninstall(item.id, { showConfirmDialog: true }, () =&gt; {
-  if (!chrome.runtime.lastError) location.reload();
-});</code></pre>
-    <p>浏览器总会显示原生卸载确认；即使网页传入 <code>showConfirmDialog: false</code> 也不能跳过。用户取消时回调中可通过 <code>chrome.runtime.lastError</code> 得到失败原因。</p>
-  </section>
+async function refreshManagedResult(action) {
+  try {
+    const items = await readBrowser(window.chrome.management, 'getAll');
+    if (!Array.isArray(items)) throw new Error('扩展列表格式无效');
+    return { items, statusWarning: null };
+  } catch (error) {
+    return { items: null, statusWarning: action + '，状态待刷新确认：' + error.message };
+  }
+}
 
-  <section>
-    <h2>错误与安全边界</h2>
-    <p>浏览器接口的异步错误通过 <code>chrome.runtime.lastError.message</code> 返回；安装预检也可能返回非空结果码。常见原因包括用户取消、当前标签页失效、权限变化、签名或清单不匹配、目录包变化、扩展正在使用。页面应重新读取目录及安装状态后再重试，不能凭按钮状态推断安装成功。</p>
-    <p>当浏览器只返回 <code>dnr_package_invalid</code> 时，本站不会把它解释为 CRX 损坏，也不会仅凭目录扫描断定内核缺少哪项能力。页面会保留原始错误码；若目录扫描发现响应头匹配规则，只将其作为排查线索。只有浏览器明确返回 <code>dnr_kernel_capability_unavailable</code> 时，才提示缺少内核能力。</p>
-    <p>本站监听 <code>0.0.0.0:18731</code>，可通过本机、局域网或当前隧道访问。它不接受上传，也没有执行安装/升级/卸载的 HTTP 写接口。<code>chrome.webstorePrivate</code> 仅向特定商店页面开放；公网签名安装由 <code>chrome.nomadSignedExtensions</code> 提供，两者的授权和能力不同。</p>
-  </section>
-</body>
-</html>
+function validateSignedStatus(item, status) {
+  if (!status || status.extensionId !== item.id || ![&#x27;absent&#x27;, &#x27;installed&#x27;, &#x27;disabled&#x27;].includes(status.state))
+    throw new Error(&#x27;浏览器安装状态无效&#x27;);
+  for (const field of [&#x27;product&#x27;, &#x27;version&#x27;]) {
+    if (status[field] != null &amp;&amp; typeof status[field] !== &#x27;string&#x27;) throw new Error(field + &#x27; 类型无效&#x27;);
+  }
+  return status;
+}</code></pre></details>
+<details><summary>签名安装及成功后状态复核</summary><pre><code id="example-signed-install" data-language="javascript">async function installSigned(item, onProgress, onProgressUnavailable) {
+  const api = window.chrome?.nomadSignedExtensions;
+  if (!item.signedProduct || ![&#x27;install&#x27;, &#x27;getStatus&#x27;, &#x27;uninstall&#x27;].every(k =&gt; typeof api?.[k] === &#x27;function&#x27;))
+    throw new Error(&#x27;当前插件或浏览器不支持签名安装&#x27;);
+  const operationId = typeof api.getOperationProgress === &#x27;function&#x27; ? newOperationId() : null;
+  const url = new URL(&#x27;/api/package&#x27;, window.location.origin);
+  url.searchParams.set(&#x27;id&#x27;, item.id);
+  url.searchParams.set(&#x27;platform&#x27;, /Android/i.test(navigator.userAgent) ? &#x27;android&#x27; : &#x27;desktop&#x27;);
+  url.searchParams.set(&#x27;sha256&#x27;, item.sha256);
+
+  // Promise executor 同步调用原生 API，前面没有 await，保留真实点击激活。
+  const pending = callBrowser(api, &#x27;install&#x27;, {
+    extensionId: item.id, packageUrl: url.href, expectedSha256: item.sha256,
+    ...(operationId &amp;&amp; { operationId })
+  });
+  const stop = watchProgress(api, item, operationId, &#x27;install&#x27;, onProgress, onProgressUnavailable);
+  let receipt;
+  try { receipt = await pending; }
+  finally { stop(); }
+  if (receipt?.extensionId !== item.id || receipt.product !== item.signedProduct || receipt.version !== item.version)
+    throw new Error(&#x27;安装回执与所选插件不一致，请刷新确认状态&#x27;);
+
+  // 原生成功之后的状态查询失败，不改报成“安装失败”，也不自动再次安装。
+  try {
+    const status = validateSignedStatus(item, await readBrowser(api, &#x27;getStatus&#x27;, item.id));
+    if (![&#x27;installed&#x27;, &#x27;disabled&#x27;].includes(status.state) ||
+        status.product != null &amp;&amp; status.product !== item.signedProduct ||
+        status.version != null &amp;&amp; status.version !== item.version)
+      throw new Error(&#x27;安装状态与本次安装尚未一致&#x27;);
+    return { receipt, status, statusWarning: null };
+  } catch (error) {
+    return { receipt, status: null, statusWarning: &#x27;浏览器已完成安装，状态待确认：&#x27; + error.message };
+  }
+}</code></pre></details>
+<details><summary>目录新装及 completeInstall</summary><pre><code id="example-catalog-install" data-language="javascript">async function installCatalog(item, onProgress, onProgressUnavailable) {
+  const api = window.chrome?.webstorePrivate;
+  if (![&#x27;beginInstallWithManifest3&#x27;, &#x27;completeInstall&#x27;].every(k =&gt; typeof api?.[k] === &#x27;function&#x27;) ||
+      typeof window.chrome?.management?.getAll !== &#x27;function&#x27;)
+    throw new Error(&#x27;当前页面没有目录安装权限&#x27;);
+  const operationId = typeof api.getOperationProgress === &#x27;function&#x27; ? newOperationId() : null;
+  const pending = callBrowser(api, &#x27;beginInstallWithManifest3&#x27;, {
+    id: item.id, manifest: JSON.stringify(item.manifest), localizedName: item.name,
+    ...(operationId &amp;&amp; { operationId })
+  });
+  const stop = watchProgress(api, item, operationId, &#x27;install&#x27;, onProgress, onProgressUnavailable);
+  let approved;
+  try { approved = await pending; }
+  finally { stop(); } // 兼容旧宿主：begin 的任务可能已被删除。
+  if (approved !== &#x27;&#x27;) throw new Error(approved || &#x27;install_failed&#x27;);
+  // 此时仅表示批准成功。无需第二次点击，在同一文档立即提交。
+  await callBrowser(api, &#x27;completeInstall&#x27;, item.id);
+  return refreshManagedResult(&#x27;浏览器已完成安装&#x27;);
+}</code></pre></details>
+<details><summary>目录更新检查及应用</summary><pre><code id="example-update" data-language="javascript">async function prepareCatalogUpdate(item, onProgress, onProgressUnavailable) {
+  const api = window.chrome?.webstorePrivate;
+  if (typeof api?.checkUpdate !== &#x27;function&#x27;) throw new Error(&#x27;当前通道不支持检查更新&#x27;);
+  const operationId = typeof api.getOperationProgress === &#x27;function&#x27; ? newOperationId() : null;
+  const options = operationId ? [{ operationId }] : []; // 旧浏览器不传新增参数。
+  const pending = callBrowser(api, &#x27;checkUpdate&#x27;, item.id, ...options);
+  const stop = watchProgress(api, item, operationId, &#x27;update_check&#x27;, onProgress, onProgressUnavailable);
+  try {
+    const result = await pending;
+    if (![&#x27;ready&#x27;, &#x27;permission_required&#x27;].includes(result?.state))
+      return { ready: false, result }; // up_to_date、throttled、error 等各自展示。
+    if (result.version !== item.version) throw new Error(&#x27;目录版本已变化，请刷新后重新准备&#x27;);
+    return { ready: true, version: result.version, sha256: item.sha256 };
+  } finally { stop(); }
+}
+
+// 由另一次用户点击直接调用；不要在 prepare 的回调中自动调用。
+async function applyCatalogUpdate(item, prepared) {
+  const api = window.chrome?.webstorePrivate;
+  if (typeof api?.applyUpdate !== &#x27;function&#x27;) throw new Error(&#x27;当前通道不支持应用更新&#x27;);
+  if (!prepared?.ready || prepared.version !== item.version || prepared.sha256 !== item.sha256)
+    throw new Error(&#x27;候选包已变化，请重新准备&#x27;);
+  const applied = await callBrowser(api, &#x27;applyUpdate&#x27;, item.id);
+  if (applied !== true) throw new Error(&#x27;升级尚未应用，可能取消、延期或候选包已失效&#x27;);
+  return refreshManagedResult(&#x27;浏览器已完成操作&#x27;);
+}</code></pre></details>
+<details><summary>两条通道的卸载</summary><pre><code id="example-uninstall" data-language="javascript">// 从对应按钮的点击处理函数直接调用；卸载确认始终由浏览器展示。
+async function uninstallSigned(item) {
+  const api = window.chrome.nomadSignedExtensions;
+  await callBrowser(api, &#x27;uninstall&#x27;, item.id);
+  try {
+    const status = validateSignedStatus(item, await readBrowser(api, &#x27;getStatus&#x27;, item.id));
+    if (status.state !== &#x27;absent&#x27;) throw new Error(&#x27;尚未确认插件已移除&#x27;);
+    return { status, statusWarning: null };
+  } catch (error) {
+    return { status: null, statusWarning: &#x27;浏览器已返回卸载成功，状态待刷新确认：&#x27; + error.message };
+  }
+}
+async function uninstallCatalog(item) {
+  await callBrowser(window.chrome.management, &#x27;uninstall&#x27;, item.id, { showConfirmDialog: true });
+  return refreshManagedResult(&#x27;浏览器已完成操作&#x27;);
+}</code></pre></details>
+<details><summary>预加载目录并绑定安装按钮</summary><pre><code id="example-binding" data-language="javascript">// 约定页面有 #install 按钮和 #install-status 文本区域。
+// 先加载目录，用户点击时只读取已经准备好的 item，不在点击回调中先取包。
+async function bindSignedInstall() {
+  const button = document.querySelector(&#x27;#install&#x27;);
+  const output = document.querySelector(&#x27;#install-status&#x27;);
+  button.disabled = true;
+  const platform = /Android/i.test(navigator.userAgent) ? &#x27;android&#x27; : &#x27;desktop&#x27;;
+  const response = await fetch(&#x27;/api/catalog?platform=&#x27; + platform, { cache: &#x27;no-store&#x27; });
+  if (!response.ok) throw new Error(&#x27;目录 HTTP &#x27; + response.status);
+  const { packages } = await response.json();
+  const item = packages.find(item =&gt; item.signedProduct); // 实际商店改为用户选中的目录项。
+  if (!item) throw new Error(&#x27;目录没有签名插件&#x27;);
+  button.textContent = &#x27;安装 &#x27; + item.name;
+  button.disabled = false;
+  button.addEventListener(&#x27;click&#x27;, () =&gt; {
+    button.disabled = true;
+    output.textContent = &#x27;等待浏览器响应&#x27;;
+    installSigned(item, p =&gt; { output.textContent = progressText(p); },
+      error =&gt; { output.textContent = &#x27;进度暂不可用，安装仍在继续：&#x27; + error.message; })
+      .then(result =&gt; { output.textContent = result.statusWarning || &#x27;安装成功&#x27;; })
+      .catch(error =&gt; { output.textContent = &#x27;安装未完成：&#x27; + error.message; })
+      .finally(() =&gt; { button.disabled = false; });
+  });
+}
+// 由页面初始化调用并处理目录加载错误：bindSignedInstall().catch(console.error)</code></pre></details>
+<p>按钮绑定示例要求业务页面提供下列元素；先调用 bindSignedInstall 完成目录读取和事件绑定，再由用户点击安装。不要直接在页面初始化时调用 installSigned。</p><pre><code id="example-button" data-language="html">&lt;button id=&quot;install&quot; type=&quot;button&quot; disabled&gt;正在读取目录&lt;/button&gt;
+&lt;pre id=&quot;install-status&quot; role=&quot;status&quot; aria-live=&quot;polite&quot;&gt;&lt;/pre&gt;</code></pre>
+</section>
+
+<section id="errors" aria-labelledby="errors-heading"><h2 id="errors-heading">结果回调与错误处理</h2>
+<p>三类结果分开处理：runtime.lastError 是浏览器异步错误；beginInstall 的非空字符串是业务结果；checkUpdate 的 state/errorCode 是更新状态。成功回调到达后再刷新状态；进度事件或网络完成不能替代它。</p><div class="table-wrap"><table><thead><tr><th scope="col">返回值或错误码</th><th scope="col">含义</th><th scope="col">处理</th></tr></thead><tbody>
+<tr><td>beginInstall 返回空字符串</td><td>验证和权限批准完成</td><td>同文档调用 completeInstall，尚不显示安装成功</td></tr>
+<tr><td>user_gesture_required / signed_extension_user_gesture_required</td><td>缺少实时点击激活</td><td>将原生入口放到点击回调，之前不 await 网络</td></tr>
+<tr><td>already_installed / signed_extension_already_installed</td><td>目标 ID 已存在</td><td>刷新状态；不要自动卸载或重试安装</td></tr>
+<tr><td>install_in_progress / signed_extension_install_in_progress</td><td>已有事务正在执行</td><td>禁用重复操作，等待原任务结果</td></tr>
+<tr><td>user_cancelled / signed_extension_confirmation_cancelled / signed_extension_operation_cancelled</td><td>用户、文档或生命周期取消</td><td>恢复操作；不伪造成功，不自动再次弹权限窗口</td></tr>
+<tr><td>signed_extension_document_unavailable / webstore_document_unavailable</td><td>发起页面刷新、关闭或文档身份失效</td><td>新页面重新读取安装状态，不能恢复旧 UUID 或安装批准</td></tr>
+<tr><td>webstore_previous_confirmation_required / webstore_confirmation_expired</td><td>completeInstall 没有本次有效批准或批准已消费</td><td>不要独立重试 completeInstall；先刷新状态，再由用户决定重新开始</td></tr>
+<tr><td>signed_extension_download_failed / webstore_download_failed</td><td>网络失败或响应不满足取包要求</td><td>检查同源包地址、HTTP 状态及浏览器诊断；保留原错误码</td></tr>
+<tr><td>webstore_arguments_invalid</td><td>参数或旧版 UUID 校验失败</td><td>按参数类型传值，使用非零 UUID，不用扩展 ID 替代稳定查询参数</td></tr>
+<tr><td>manifest_error</td><td>页面清单预览与实际包不一致</td><td>刷新目录并重新选择候选</td></tr>
+<tr><td>signed_extension_host_unavailable</td><td>当前精确宿主能力没有登记或实际运行包不配套</td><td>核对内核、KernelHost、Foundation 和 UI 宿主版本</td></tr>
+<tr><td>signed_extension_download_url_invalid</td><td>来源、同源、URL 形式不满足要求</td><td>检查 scheme/host/port 及 URL 用户信息、fragment</td></tr>
+<tr><td>signed_extension_package_hash_mismatch / HTTP 409 package_changed</td><td>目录摘要或下载文件已经变化</td><td>刷新目录，禁止把旧候选当作本次包继续安装</td></tr>
+<tr><td>signed_extension_signature_invalid / webstore_package_invalid</td><td>发布签名或 CRX/身份/包结构校验失败</td><td>保留原始码并查浏览器安装阶段日志；signedProduct 不是验签结果</td></tr>
+<tr><td>crx_native_stage_failed</td><td>暂存阶段通用失败</td><td>查安装器详细诊断，不能直接归因于签名或 DNR</td></tr>
+<tr><td>dnr_package_invalid</td><td>DNR 校验失败</td><td>不凭目录扫描断言内核缺能力</td></tr>
+<tr><td>dnr_kernel_capability_unavailable</td><td>明确缺少所需 DNR 能力</td><td>提示换用兼容内核</td></tr>
+<tr><td>operation_id_invalid / operation_id_in_use 类错误</td><td>UUID 非法、全零或重复</td><td>每次点击生成新的非零 UUID；不要传 null 字段</td></tr>
+<tr><td>成功回执后状态读取失败</td><td>安装可能已经完成</td><td>显示已完成但状态待确认，提供刷新入口；不要改判为普通下载失败</td></tr>
+</tbody></table></div><p>目录通道常见诊断消息为中文加末尾括号码，例如 <code>扩展程序包校验失败。 (webstore_package_invalid)</code>；可按末尾 <code>([a-z][a-z0-9_]+)</code> 提取稳定码。签名通道通常直接返回 signed_extension_*。显示未知错误时保留 message，避免把所有失败都改成“下载失败”。卸载取消也可能是 <code>User cancelled uninstall</code>。</p>
+</section>
+
+<section id="compatibility" aria-labelledby="compatibility-heading"><h2 id="compatibility-heading">版本与可用性排查</h2>
+<p>当前示例按每次操作生成 UUID 的方式接入，适配现有 Demo。签名通道缺少 getter 的旧浏览器仍可返回原安装结果；网页不能单独补出真实阶段或字节计数。</p><pre><code id="example-capability" data-language="javascript">console.table({
+  origin: window.location.origin,
+  signedInstall: typeof window.chrome?.nomadSignedExtensions?.install,
+  signedProgress: typeof window.chrome?.nomadSignedExtensions?.getOperationProgress,
+  catalogInstall: typeof window.chrome?.webstorePrivate?.beginInstallWithManifest3,
+  catalogProgress: typeof window.chrome?.webstorePrivate?.getOperationProgress,
+  checkUpdate: typeof window.chrome?.webstorePrivate?.checkUpdate,
+  applyUpdate: typeof window.chrome?.webstorePrivate?.applyUpdate,
+  randomUUID: typeof window.crypto?.randomUUID,
+  getRandomValues: typeof window.crypto?.getRandomValues
+});</code></pre><p>部分较新宿主源码包含持续安装任务、内部自动 UUID、按扩展 ID 查询最新任务和 awaiting_install；本次核对的签名网页内核查询门禁仍要求 36 字符 UUID。不要将宿主能解析某字段等同于目标网页已经可用。目录终态保留和 completeInstall 全过程查询也需要与内核 schema、宿主交付及网页接线同时核对，不能只换其中一层。</p><p>本 Demo 当前在 beginInstall 回调后停止该轮进度，并根据 completeInstall 调用边界显示安装；checkUpdate 只展示候选准备。本文保留这一兼容调用方式，较新宿主可返回更多阶段，未知阶段应显示通用等待文本。</p><p>看不到进度时先确认阶段条是否在视野中，再检查 getter 是否存在及实际错误。局域网 HTTP 缺少 randomUUID 时可用 getRandomValues；快速本机下载可能被 300 毫秒轮询跳过，使用限速环境复测。浏览器顶部加载条来自导航，不是安装状态。</p>
+</section>
+
+<section id="operations" aria-labelledby="operations-heading"><h2 id="operations-heading">启停与联调</h2>
+<p>唯一用户命令入口为 start.sh、start.command、start.bat。macOS 可双击 start.command，Linux 使用 start.sh，Windows 使用 start.bat。</p><div class="table-wrap"><table><thead><tr><th scope="col">操作</th><th scope="col">macOS / Linux</th><th scope="col">Windows</th></tr></thead><tbody>
+<tr><td>启动并打开网页</td><td><code>./start.sh</code></td><td><code>start.bat</code></td></tr>
+<tr><td>查看当前地址</td><td><code>./start.sh status</code></td><td><code>start.bat status</code></td></tr>
+<tr><td>按保存配置重启</td><td><code>./start.sh restart</code></td><td><code>start.bat restart</code></td></tr>
+<tr><td>停止服务和隧道</td><td><code>./start.sh stop</code></td><td><code>start.bat stop</code></td></tr>
+</tbody></table></div><p>start/restart 可带 --packages-dir、--package-delay-ms、--package-without-length、--no-tunnel / --tunnel、--browser、--no-open；--port 和 --runtime-dir 用于隔离实例。macOS --browser 要填写 app bundle 内可执行文件，不能直接填写 .app 目录。重复 start 复用现有服务和域名，真正 restart 重新申请公网域名。状态及日志保存在 .runtime。</p><pre><code id="example-start" data-language="shell"># 已经启动时，用 restart 应用限速设置；不要启动另一个相同端口实例。
+./start.sh restart --no-open --package-delay-ms 450
+# 模拟服务没有 Content-Length：
+./start.sh restart --no-open --package-without-length
+./start.sh status</code></pre><p>限速在约八个包体位置等待，保持流式读取；已知与未知总大小都应测。当前没有 --no-package-without-length 反向参数，正式测试配置应与日常实例隔离。非 18731 端口只适合 HTTP 或符合签名通道来源规则的测试，不获得本机目录授权。</p><p>HTTP 服务不接受上传，没有安装、升级或卸载写接口。唯一生命周期写路由 <code>POST /_control/stop</code> 供控制器使用，要求回环 Host、本机私有 token 且不带网页 Origin / Sec-Fetch-Site；当前不额外检查 TCP peer。前端不调用此路由，也不保存或分享该凭据。</p>
+</section>
+
+<section id="verification" aria-labelledby="verification-heading"><h2 id="verification-heading">接入验收清单</h2>
+<ol>
+<li>在目标构建和来源检查四个必需安装/管理方法及可选 getter，普通 Chrome 显示能力说明。</li>
+<li>预加载目录后点击新装，观察准备、下载、校验、权限等待；下载 100% 后仍等待结果。</li>
+<li>分别检查有 totalBytes 和未知大小；查询失败、空快照、旧 UUID 不应影响原结果回调。</li>
+<li>签名成功回执匹配后查询安装状态；元数据可选，状态失败保留已完成待确认提示。</li>
+<li>目录 begin 成功后只提交一次 completeInstall；更新准备完成与实际应用分开。</li>
+<li>测试权限取消、签名/摘要不符、重复点击、刷新文档、候选包替换及卸载确认。</li>
+<li>只将真实浏览器写入并完成原生确认的结果记为原生安装通过；网页模拟桥接只验证接口交互与展示。</li>
+</ol><p>2026-11-24 的 Demo 回归记录包括 31 项 Python 检查、前端签名及目录安装/更新回归，以及已知/未知大小的真实 CRX HTTP 下载和网页展示。最近一次网页展示使用模拟浏览器安装接口；原生界面连接超时，不能据此宣称本轮真实原生安装完成。架构、源码定位与交付记录见仓库 <code>docs/逐风扩展商店Demo技术文档.md</code>。</p>
+</section>
+
+<footer><a href="/">返回商店</a> · 文档对应当前 Demo 接入方式；浏览器能力以配套构建及实际回调为准。</footer>
+</main></div>
+</body></html>

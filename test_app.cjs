@@ -266,6 +266,66 @@ function signedBrowser(options = {}) {
   assert.equal(legacyCalls[1][0], 'complete');
   assert.equal(local.status(), '安装成功。');
 
+  // The catalog route stops beginInstall polling before completeInstall, and
+  // update_check finishes only package preparation, not the installation step.
+  const catalogItem = { ...ordinary };
+  let beginCallback, completeCallback, checkCallback, applyCallback;
+  let managed = [], stage = 'downloading', operation = 'install';
+  const catalogCalls = [];
+  const catalogBrowser = { runtime: {}, management: { getAll: cb => cb(managed) }, webstorePrivate: {
+    beginInstallWithManifest3(details, cb) { catalogCalls.push(['begin', details]); beginCallback = cb; },
+    completeInstall(id, cb) { catalogCalls.push(['complete', id]); completeCallback = cb; },
+    checkUpdate(id, options, cb) { catalogCalls.push(['check', id, options]); checkCallback = cb; },
+    applyUpdate(id, cb) { catalogCalls.push(['apply', id]); applyCallback = cb; },
+    getOperationProgress(id, cb) { cb({ progress: { operationId: id, operation,
+      extensionId: catalogItem.id, stage, receivedBytes: 25, totalBytes: 100 } }); },
+  } };
+  const catalogPage = await page(catalogBrowser, [catalogItem]);
+  let uuid = 0, timerSequence = 0;
+  const catalogTimers = new Map();
+  catalogPage.context.window.crypto = { randomUUID: () => `eeeeeeee-eeee-4eee-8eee-${String(++uuid).padStart(12, '0')}` };
+  catalogPage.context.setTimeout = fn => { catalogTimers.set(++timerSequence, fn); return timerSequence; };
+  catalogPage.context.clearTimeout = id => catalogTimers.delete(id);
+  async function catalogTick() {
+    const [id, fn] = catalogTimers.entries().next().value;
+    catalogTimers.delete(id); await fn();
+  }
+  const installCatalog = catalogPage.context.install(catalogItem);
+  assert.equal(catalogCalls[0][0], 'begin', 'catalog install preserves the synchronous user click');
+  await catalogTick(); assert.match(catalogPage.status(), /25%/);
+  stage = 'verifying'; await catalogTick();
+  assert.equal(catalogPage.nodes['#step-verify'].dataset.state, 'active');
+  stage = 'awaiting_user_confirmation'; await catalogTick();
+  assert.match(catalogPage.status(), /权限窗口确认/);
+  beginCallback(''); await settle();
+  assert.equal(catalogCalls[1][0], 'complete');
+  assert.equal(catalogTimers.size, 0, 'beginInstall task is finished before completeInstall starts');
+  assert.equal(catalogPage.nodes['#step-install'].dataset.state, 'active');
+  assert.doesNotMatch(catalogPage.status(), /安装成功/);
+  managed = [{ id: catalogItem.id, type: 'extension', version: catalogItem.version, enabled: true }];
+  completeCallback(); await installCatalog;
+  assert.equal(catalogPage.status(), '安装成功。');
+
+  catalogItem.version = '1.1'; catalogItem.sha256 = '2'.repeat(64);
+  await catalogPage.context.refresh();
+  stage = 'downloading'; operation = 'update_check';
+  const prepareCatalog = catalogPage.context.checkUpdate(catalogItem);
+  const updateOptions = catalogCalls.find(call => call[0] === 'check')[2];
+  assert.notEqual(updateOptions.operationId, catalogCalls[0][1].operationId, 'new update check has a separate operation ID');
+  await catalogTick(); assert.match(catalogPage.status(), /25%/);
+  stage = 'verifying'; await catalogTick();
+  checkCallback({ state: 'ready', version: '1.1' }); await prepareCatalog;
+  assert.equal(catalogTimers.size, 0);
+  assert.equal(catalogPage.nodes['#step-verify'].dataset.state, 'done');
+  assert.equal(catalogPage.nodes['#step-install'].dataset.state, 'pending');
+  assert.equal(catalogPage.buttons(0)[0].textContent, '升级');
+  const applyCatalog = catalogPage.context.applyUpdate(catalogItem);
+  assert.equal(catalogPage.nodes['#step-install'].dataset.state, 'active');
+  assert.doesNotMatch(catalogPage.status(), /升级成功/);
+  managed[0].version = '1.1'; applyCallback(true); await applyCatalog;
+  assert.equal(catalogPage.status(), '升级成功。');
+  assert.equal(catalogPage.nodes['#step-install'].dataset.state, 'done');
+
   // A failed refresh must not leave stale actionable buttons behind.
   const recoveryBrowser = signedBrowser();
   const recovery = await page(recoveryBrowser.chrome);
@@ -347,5 +407,5 @@ function signedBrowser(options = {}) {
   runtime.lanUrl = 'javascript:alert(1)';
   await context.loadRuntime();
   assert.deepEqual(addresses(), [runtime.localUrl]);
-  console.log('PASS: signed HTTPS lifecycle, scoped progress, unknown length, fallback, cancellation, receipts and legacy install');
+  console.log('PASS: signed and catalog installation, scoped byte progress, update preparation/application, fallback, cancellation and receipts');
 })().catch(error => { console.error(error); process.exitCode = 1; });

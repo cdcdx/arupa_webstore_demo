@@ -1,5 +1,6 @@
 import concurrent.futures
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from unittest import mock
 
 import crx_catalog
@@ -150,6 +152,132 @@ class StoreLifecycleTests(unittest.TestCase):
 
 
 class HttpAndCatalogTests(unittest.TestCase):
+    def test_http_requests_share_cache_and_invalidate_errors_replacements_and_deletion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); package = root / "demo.crx"
+            original = (server.PACKAGES / "nomad-demo-1.0.crx").read_bytes()
+            package.write_bytes(original)
+            httpd = server.DemoServer(("127.0.0.1", 0), root)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+
+            def get(route):
+                connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
+                try:
+                    connection.request("GET", route); response = connection.getresponse()
+                    return response.status, response.read()
+                finally: connection.close()
+
+            try:
+                with mock.patch.object(crx_catalog, "read_package", wraps=crx_catalog.read_package) as reader:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                        responses = list(pool.map(get, ["/api/catalog?platform=desktop", "/api/catalog?platform=android"] * 3))
+                    self.assertTrue(all(code == 200 for code, _ in responses))
+                    self.assertEqual(reader.call_count, 1, "one shared parse across concurrent HTTP requests and platforms")
+                    self.assertEqual(get("/api/package?id=" + crx_catalog.crx_id(original)), (200, original))
+                    self.assertEqual(reader.call_count, 1, "download reuses metadata but still verifies file bytes")
+                    replacement = root / "new.tmp"
+                    replacement.write_bytes((server.ROOT / "samples/nomad-demo-1.1.crx").read_bytes()); replacement.replace(package)
+                    self.assertEqual(json.loads(get("/api/catalog")[1])["packages"][0]["version"], "1.1")
+                    self.assertEqual(reader.call_count, 2)
+                    package.write_bytes(b"invalid package")
+                    for _ in range(2):
+                        payload = json.loads(get("/api/catalog")[1])
+                        self.assertEqual(payload["packages"], []); self.assertEqual(len(payload["errors"]), 1)
+                    self.assertEqual(reader.call_count, 3, "invalid packages are cached until their file changes")
+                    package.write_bytes(original)
+                    self.assertEqual(json.loads(get("/api/catalog")[1])["packages"][0]["version"], "1.0")
+                    self.assertEqual(reader.call_count, 4)
+                    package.unlink()
+                    self.assertEqual(json.loads(get("/api/catalog")[1]), {"packages": [], "errors": []})
+            finally:
+                httpd.shutdown(); httpd.server_close(); thread.join()
+
+    def test_cached_regular_file_cannot_be_replaced_with_a_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); path = root / "demo.crx"
+            path.write_bytes((server.PACKAGES / "nomad-demo-1.0.crx").read_bytes())
+            index = crx_catalog.CatalogIndex(root)
+            self.assertEqual(len(index.get()[0]), 1)
+            target = root / "moved.tmp"; path.replace(target)
+            try: path.symlink_to(target)
+            except OSError: self.skipTest("symlink creation unavailable")
+            packages, errors = index.get()
+            self.assertEqual(packages, []); self.assertEqual(len(errors), 1)
+
+    def test_download_uses_bounded_reads_known_and_unknown_length_and_closes_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); path = root / "demo.crx"
+            # Structural fixture for HTTP transfer; native signing is tested separately.
+            memory = io.BytesIO((server.PACKAGES / "nomad-demo-1.0.crx").read_bytes())
+            with zipfile.ZipFile(memory, "a") as archive:
+                archive.writestr("transfer-fixture.bin", b"x" * (server.PACKAGE_CHUNK_BYTES * 4))
+            raw = memory.getvalue(); path.write_bytes(raw)
+            httpd = server.DemoServer(("127.0.0.1", 0), root, package_delay=0.01)
+            item, = httpd.catalog.get()[0]
+            streams, reads = [], []
+            original_open = Path.open
+            case = self
+
+            class BoundedFile:
+                def __init__(self, stream): self.stream = stream
+                def __getattr__(self, name): return getattr(self.stream, name)
+                def __enter__(self): return self
+                def __exit__(self, *args): self.stream.close()
+                def read(self, size=-1):
+                    case.assertGreater(size, 0, "unbounded file reads are forbidden")
+                    case.assertLessEqual(size, server.PACKAGE_CHUNK_BYTES)
+                    reads.append((self.stream.tell(), size))
+                    return self.stream.read(size)
+
+            def open_file(candidate, *args, **kwargs):
+                stream = original_open(candidate, *args, **kwargs)
+                if candidate == path and args == ("rb",):
+                    streams.append(stream); return BoundedFile(stream)
+                return stream
+
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+            try:
+                with mock.patch.object(Path, "open", open_file), mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file download")):
+                    for without_length in (False, True):
+                        httpd.package_without_length = without_length
+                        connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
+                        try:
+                            connection.request("GET", f"/api/package?id={item.extension_id}&sha256={item.sha256}")
+                            response = connection.getresponse()
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(response.getheader("Content-Length"), None if without_length else str(len(raw)))
+                            received = bytearray()
+                            while chunk := response.read(8192): received.extend(chunk)
+                            self.assertEqual(bytes(received), raw)
+                        finally: connection.close()
+                    connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
+                    connection.request("GET", "/api/package?id=" + item.extension_id)
+                    response = connection.getresponse(); response.read(1); connection.close()
+                    wait_until(lambda: all(stream.closed for stream in streams))
+                self.assertEqual(len(streams), 3)
+                self.assertGreaterEqual(sum(position == 0 for position, _ in reads), 6, "same open file is verified then rewound for each transfer")
+            finally:
+                httpd.shutdown(); httpd.server_close(); thread.join()
+
+    def test_file_changed_after_catalog_lookup_is_rejected_before_success_headers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); path = root / "demo.crx"
+            original = (server.PACKAGES / "nomad-demo-1.0.crx").read_bytes(); path.write_bytes(original)
+            httpd = server.DemoServer(("127.0.0.1", 0), root)
+            original_send = server.Handler.send_package
+            def change_before_verification(handler, package):
+                path.write_bytes(b"x" * len(original))
+                return original_send(handler, package)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+            connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
+            try:
+                with mock.patch.object(server.Handler, "send_package", change_before_verification):
+                    connection.request("GET", "/api/package?id=" + crx_catalog.crx_id(original))
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 409); self.assertEqual(response.read(), b"package_changed")
+            finally:
+                connection.close(); httpd.shutdown(); httpd.server_close(); thread.join()
+
     def test_metadata_cache_invalidates_on_replace_and_delete(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

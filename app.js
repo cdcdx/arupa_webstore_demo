@@ -2,6 +2,12 @@ const rows = document.querySelector('#packages');
 const status = document.querySelector('#status');
 const downloadProgress = document.querySelector('#download-progress');
 const refreshButton = document.querySelector('#refresh');
+const progressPanel = document.querySelector('#install-progress');
+const progressHeading = document.querySelector('#progress-heading');
+const progressNote = document.querySelector('#progress-note');
+const progressSteps = ['#step-download', '#step-verify', '#step-install'].map(id => document.querySelector(id));
+let currentStep = -1;
+let currentOperation = 'install';
 let busy = false;
 let catalogReady = false;
 let packages = [];
@@ -29,6 +35,31 @@ function apiReady() {
 function signedApiReady() {
   return ['install', 'getStatus', 'uninstall'].every(name =>
     typeof window.chrome?.nomadSignedExtensions?.[name] === 'function');
+}
+function canCreateOperationId() {
+  return typeof window.crypto?.randomUUID === 'function' || typeof window.crypto?.getRandomValues === 'function';
+}
+function createOperationId() {
+  if (typeof window.crypto?.randomUUID === 'function') return window.crypto.randomUUID();
+  if (typeof window.crypto?.getRandomValues !== 'function') return null;
+  // getRandomValues is also available on RFC1918 HTTP test pages, unlike randomUUID.
+  const bytes = window.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+function showProgressAvailability() {
+  if (progressPanel.dataset.result && progressPanel.dataset.result !== 'idle') return;
+  progressPanel.dataset.result = 'idle';
+  progressPanel.hidden = false;
+  progressHeading.textContent = '安装进度';
+  renderSteps(0);
+  const api = signedApiReady() ? window.chrome.nomadSignedExtensions : apiReady() ? window.chrome.webstorePrivate : null;
+  progressNote.textContent = !api ? '请使用逐风浏览器打开本页，再点击插件右侧的“安装”。' :
+    typeof api.getOperationProgress !== 'function' ? '当前浏览器的安装接口仅返回最终结果，无法回传实时进度；请使用包含进度接口的逐风版本。' :
+    !canCreateOperationId() ? '当前页面无法创建进度查询，请使用本机地址或公网 HTTPS 地址打开。' :
+    '选择插件并点击“安装”，这里将显示下载、校验、权限确认与安装进度。';
 }
 function installMode(item) {
   if (item.signedProduct && signedApiReady()) return 'signed';
@@ -110,11 +141,68 @@ const stageLabels = {
   verifying: '正在校验 CRX…',
   opening_confirmation: '正在打开权限窗口…',
   awaiting_user_confirmation: '请在浏览器权限窗口确认。',
+  preflight: '正在检查插件兼容性与权限…',
+  installing: '正在安装并启动扩展…',
+  committing: '正在确认安装结果…',
+  rolling_back: '安装未完成，正在回滚…',
+  completed: '安装已完成，正在确认状态…',
+  failed: '安装失败，正在读取错误信息…',
+  cancelled: '安装已取消。',
 };
-function trackProgress(item, operation, fallback) {
-  const api = window.chrome?.webstorePrivate;
-  if (typeof api?.getOperationProgress !== 'function' || typeof window.crypto?.randomUUID !== 'function') return null;
-  const operationId = window.crypto.randomUUID();
+function renderSteps(completed, active = -1, state = 'active') {
+  for (const [index, step] of progressSteps.entries()) {
+    step.dataset.state = index < completed ? 'done' : index === active ? state : 'pending';
+    if (index === active && state === 'active') step.setAttribute('aria-current', 'step');
+    else step.removeAttribute('aria-current');
+  }
+}
+function setInstallStage(stage) {
+  const step = { preparing: 0, downloading: 0, verifying: 1, preflight: 1,
+    opening_confirmation: 2, awaiting_user_confirmation: 2, installing: 2,
+    committing: 2, rolling_back: 2, completed: 2 }[stage];
+  if (step !== undefined) currentStep = step;
+  progressPanel.dataset.stage = stage;
+  renderSteps(Math.max(0, currentStep), currentStep,
+    ['failed', 'cancelled'].includes(stage) ? stage : 'active');
+  progressNote.textContent = stage === 'downloading' ? '下载完成后将继续校验扩展包，并请求安装权限。' :
+    ['opening_confirmation', 'awaiting_user_confirmation'].includes(stage) ? '等待浏览器权限确认；确认后开始安装。' :
+    stage === 'completed' ? '正在等待并核对浏览器最终安装结果。' :
+    stage === 'unknown' ? '当前无法查询中间进度，请留意权限窗口并等待安装结果。' : '请保持此页面打开，浏览器正在处理安装。';
+}
+function beginInstallProgress(item, operation, tracked, ready = false) {
+  currentStep = ready ? 2 : -1;
+  currentOperation = operation;
+  progressPanel.hidden = false;
+  progressPanel.dataset.result = 'pending';
+  progressHeading.textContent = `${item.name} · ${operation === 'update_check' ? '升级包准备进度' : '安装进度'}`;
+  downloadProgress.hidden = true;
+  setInstallStage(ready ? 'installing' : tracked ? 'preparing' : 'unknown');
+  if (!tracked && !ready) progressNote.textContent = '当前浏览器未提供分阶段进度，请留意权限窗口并等待安装结果。';
+  progressPanel.scrollIntoView({ block: 'center', behavior: 'auto' });
+}
+function finishInstallProgress(result) {
+  progressPanel.dataset.result = result;
+  downloadProgress.hidden = true;
+  if (['success', 'unconfirmed'].includes(result)) {
+    renderSteps(3);
+    progressPanel.dataset.stage = 'completed';
+    progressNote.textContent = result === 'success' ? '安装完成，浏览器已确认安装结果。' : '浏览器已完成安装，安装状态待刷新确认。';
+  } else if (result === 'ready') {
+    renderSteps(2);
+    progressNote.textContent = '升级包已准备好，点击“升级”后开始安装。';
+  } else {
+    renderSteps(Math.max(0, currentStep), currentStep, result);
+    progressPanel.dataset.stage = result;
+    progressNote.textContent = `${currentOperation === 'update_check' ? '升级包准备' : '安装'}${result === 'cancelled' ? '已取消' : '未完成'}，具体结果见下方提示。`;
+  }
+}
+function finishInstallError(error) {
+  finishInstallProgress(/cancel/i.test(error?.message || '') ? 'cancelled' : 'failed');
+}
+function trackProgress(item, operation, fallback, api = window.chrome?.webstorePrivate) {
+  if (typeof api?.getOperationProgress !== 'function') return null;
+  const operationId = createOperationId();
+  if (!operationId) return null;
   let active = true;
   let timer = setTimeout(poll, 0);
   function stop() {
@@ -130,9 +218,13 @@ function trackProgress(item, operation, fallback) {
       if (progress?.operationId === operationId && progress.extensionId === item.id && progress.operation === operation) {
         const { stage, receivedBytes, totalBytes } = progress;
         status.dataset.stage = stage;
+        setInstallStage(stage);
         downloadProgress.hidden = stage !== 'downloading';
         if (stage === 'downloading') {
-          if (Number.isFinite(totalBytes) && totalBytes > 0) {
+          if (!Number.isFinite(receivedBytes) || receivedBytes < 0) {
+            downloadProgress.removeAttribute('value');
+            show('正在下载 CRX · 等待字节数据…');
+          } else if (Number.isFinite(totalBytes) && totalBytes > 0) {
             downloadProgress.max = totalBytes;
             downloadProgress.value = Math.min(receivedBytes, totalBytes);
             const percent = Math.min(100, Math.floor(100 * receivedBytes / totalBytes));
@@ -144,8 +236,11 @@ function trackProgress(item, operation, fallback) {
         } else if (stageLabels[stage]) show(stageLabels[stage]);
       }
       timer = setTimeout(poll, 300);
-    } catch {
-      if (active) { stop(); show(fallback); }
+    } catch (error) {
+      if (active) {
+        stop(); currentStep = -1; setInstallStage('unknown'); show(fallback);
+        progressNote.textContent = `进度查询不可用：${error.message}。安装仍在继续，请留意浏览器权限窗口。`;
+      }
     }
   }
   return { operationId, stop };
@@ -239,7 +334,7 @@ async function refresh({ internal = false } = {}) {
       statusErrors.size ? `${summary} 有 ${statusErrors.size} 个插件的安装状态读取失败，请刷新重试。` : summary);
     return true;
   } catch (error) { show(`读取目录失败：${error.name === 'AbortError' ? '请求超时，请检查服务后重试' : error.message}`); return false; }
-  finally { setBusy(previousBusy); }
+  finally { setBusy(previousBusy); showProgressAvailability(); }
 }
 async function refreshAfter(message) {
   const refreshed = await refresh({ internal: true });
@@ -250,6 +345,7 @@ async function install(item) {
   if (installMode(item) === 'signed') return installSigned(item);
   const fallback = '等待浏览器核验与确认…';
   const progress = trackProgress(item, 'install', fallback);
+  beginInstallProgress(item, 'install', !!progress);
   // Privileged entry must run synchronously in the click activation.
   const pending = callChrome(chrome.webstorePrivate, 'beginInstallWithManifest3', {
     id: item.id, manifest: JSON.stringify(item.manifest), localizedName: item.name,
@@ -260,10 +356,11 @@ async function install(item) {
     const result = await pending;
     progress?.stop();
     if (result !== '') throw new Error(result || 'install_failed');
-    show('正在安装…');
+    setInstallStage('installing'); show('正在安装…');
     await callChrome(chrome.webstorePrivate, 'completeInstall', item.id);
+    finishInstallProgress('success');
     await refreshAfter('安装成功。');
-  } catch (error) { show(installErrorMessage(error, item)); }
+  } catch (error) { finishInstallError(error); show(installErrorMessage(error, item)); }
   finally { progress?.stop(); setBusy(false); }
 }
 async function installSigned(item) {
@@ -271,14 +368,19 @@ async function installSigned(item) {
   packageUrl.searchParams.set('id', item.id);
   packageUrl.searchParams.set('platform', platform);
   packageUrl.searchParams.set('sha256', item.sha256);
+  const fallback = '浏览器正在取包并校验发布签名，请留意权限确认窗口…';
+  const progress = trackProgress(item, 'install', fallback, window.chrome?.nomadSignedExtensions);
+  beginInstallProgress(item, 'install', !!progress);
   // Keep the native call inside the original click's user activation.
   const pending = callChrome(chrome.nomadSignedExtensions, 'install', {
     extensionId: item.id, packageUrl: packageUrl.href, expectedSha256: item.sha256,
+    ...(progress && { operationId: progress.operationId }),
   });
-  setBusy(true); show('浏览器正在取包并校验发布签名，请留意权限确认窗口…');
+  setBusy(true); show(progress ? '准备取包…' : fallback);
   let installedReceipt = false;
   try {
     const result = await pending;
+    progress?.stop();
     if (result?.extensionId !== item.id || result.product !== item.signedProduct || result.version !== item.version)
       throw new Error('安装回执与所选插件不一致');
     installedReceipt = true;
@@ -287,15 +389,20 @@ async function installSigned(item) {
         current.product !== null && current.product !== item.signedProduct ||
         current.version !== null && current.version !== item.version)
       throw new Error('安装状态尚未确认，请刷新重试');
+    finishInstallProgress('success');
     await refreshAfter('安装成功。');
   } catch (error) {
+    if (installedReceipt) finishInstallProgress('unconfirmed');
+    else finishInstallError(error);
     show(installedReceipt ? `浏览器已完成安装，但安装状态未确认：${error.message}。请刷新重试。` : installErrorMessage(error, item));
   }
-  finally { setBusy(false); }
+  finally { progress?.stop(); setBusy(false); }
 }
 async function uninstall(item) {
   const mode = installMode(item);
   if (busy || !catalogReady || !mode || statusErrors.has(item.id)) return;
+  progressPanel.dataset.result = 'idle';
+  showProgressAvailability();
   const pending = mode === 'signed'
     ? callChrome(chrome.nomadSignedExtensions, 'uninstall', item.id)
     : callChrome(chrome.management, 'uninstall', item.id, { showConfirmDialog: true });
@@ -315,6 +422,7 @@ async function checkUpdate(item) {
   if (busy || !catalogReady || statusErrors.has(item.id) || !canUpdate(item)) return;
   const fallback = '正在验证本地升级包…';
   const progress = trackProgress(item, 'update_check', fallback);
+  beginInstallProgress(item, 'update_check', !!progress);
   setBusy(true); show(progress ? '准备取包…' : fallback);
   try {
     const options = progress ? [{ operationId: progress.operationId }] : [];
@@ -324,42 +432,52 @@ async function checkUpdate(item) {
       throw new Error(result.errorCode || result.state);
     if (result.version !== item.version) throw new Error('版本已变化，请刷新后重试');
     prepared.set(item.id, item.sha256);
+    finishInstallProgress('ready');
     show(`版本 ${result.version} 已准备好，点击“升级”应用。`);
-  } catch (error) { show(`升级准备失败：${error.message}`); }
+  } catch (error) { finishInstallError(error); show(`升级准备失败：${error.message}`); }
   finally { progress?.stop(); setBusy(false); }
 }
 async function applyUpdate(item) {
   if (busy || !catalogReady || statusErrors.has(item.id) || !canUpdate(item)) return;
+  beginInstallProgress(item, 'install', false, true);
   const pending = callChrome(chrome.webstorePrivate, 'applyUpdate', item.id);
   setBusy(true); show('正在升级，若权限变化请在浏览器中确认…');
   try {
     if (!await pending) throw new Error('升级未应用，可能有扩展页面正在使用或操作被取消');
+    finishInstallProgress('success');
     prepared.delete(item.id); await refreshAfter('升级成功。');
-  } catch (error) { show(`升级未完成：${error.message}`); }
+  } catch (error) { finishInstallError(error); show(`升级未完成：${error.message}`); }
   finally { setBusy(false); }
 }
 
 refreshButton.addEventListener('click', () => void refresh());
 void refresh();
 
+let lastRuntime = '';
 async function loadRuntime() {
   const panel = document.querySelector('#service-status');
   if (!panel) return;
   try {
     const runtime = await fetchJson('/api/runtime');
+    const snapshot = JSON.stringify([runtime.localUrl, runtime.lanUrl, runtime.tunnel]);
+    if (snapshot === lastRuntime) return;
+    lastRuntime = snapshot;
     panel.replaceChildren();
-    for (const [label, address] of [['本机', runtime.localUrl], ['局域网', runtime.lanUrl], ['公网', runtime.tunnel?.publicUrl]]) {
+    for (const [label, address] of [['本机', runtime.localUrl], ['局域网', runtime.lanUrl],
+      ['公网', runtime.tunnel?.state === 'ready' ? runtime.tunnel.publicUrl : null]]) {
       if (!address) continue;
       const url = new URL(address);
       if (!['http:', 'https:'].includes(url.protocol)) continue;
       const link = document.createElement('a');
       link.href = url.href; link.textContent = `${label}：${url.origin}`;
+      link.target = '_blank'; link.rel = 'noopener noreferrer';
       panel.append(link, ' ');
     }
     const state = runtime.tunnel?.state;
     if (state !== 'ready') panel.append({ starting: '公网隧道正在连接…', disabled: '公网隧道未开启',
       failed: '公网隧道不可用，本机与局域网仍可访问；请运行 start.* status 或查看日志', stopped: '服务正在停止' }[state] || '公网状态未知');
   } catch {
+    lastRuntime = '';
     panel.textContent = '无法连接商店服务，请运行 start.* status 检查，或运行 start.* 启动。';
   } finally { setTimeout(loadRuntime, 5000); }
 }

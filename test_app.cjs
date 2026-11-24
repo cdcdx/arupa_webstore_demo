@@ -13,12 +13,17 @@ function element(tag = '') {
     append(...children) { this.children.push(...children); },
     replaceChildren() { this.children = []; },
     addEventListener(name, handler) { this[name] = handler; },
+    setAttribute(name, value) { this[name] = value; },
+    removeAttribute(name) { delete this[name]; },
+    scrollIntoView(options) { this.scrolledIntoView = options; },
     insertRow() { const row = element('tr'); this.append(row); return row; },
     insertCell() { const cell = element('td'); this.append(cell); return cell; },
   };
 }
 async function page(chrome = {}, items = [signed, ordinary], userAgent = 'Desktop') {
-  const nodes = Object.fromEntries(['#packages', '#status', '#refresh', '#download-progress'].map(id => [id, element()]));
+  const nodes = Object.fromEntries(['#packages', '#status', '#refresh', '#download-progress',
+    '#install-progress', '#progress-heading', '#progress-note', '#step-download', '#step-verify', '#step-install']
+    .map(id => [id, element()]));
   const requests = [];
   const context = { document: { querySelector: id => nodes[id], createElement: element },
     window: { chrome, navigator: { userAgent }, location: { origin: 'https://store.example' } },
@@ -63,12 +68,19 @@ function signedBrowser(options = {}) {
   assert.match(unsupported.actions(0).textContent, /新版逐风/);
   assert.equal(unsupported.actions(1).textContent, '无签名');
   assert.equal(unsupported.nodes['#packages'].children[0].children[3].textContent, '无法读取');
+  assert.equal(unsupported.nodes['#install-progress'].hidden, false, 'the progress panel is visible before installing');
+  assert.match(unsupported.nodes['#progress-note'].textContent, /逐风浏览器/);
 
   const browser = signedBrowser();
   const publicPage = await page(browser.chrome);
+  assert.match(publicPage.nodes['#progress-note'].textContent, /仅返回最终结果/);
   assert.equal(publicPage.buttons(0)[0].textContent, '安装');
   assert.equal(publicPage.buttons(1).length, 0, 'ordinary CRX cannot use the public signed route');
   const pending = publicPage.context.install(signed);
+  assert.equal(publicPage.nodes['#install-progress'].scrolledIntoView.block, 'center', 'installation reveals progress even from a lower table row');
+  assert.equal(publicPage.nodes['#install-progress'].hidden, false);
+  assert.match(publicPage.nodes['#progress-note'].textContent, /未提供分阶段进度/);
+  assert.equal(publicPage.nodes['#step-download'].dataset.state, 'pending', 'old APIs do not invent download progress');
   const nativeCall = browser.calls.find(call => call[0] === 'install');
   assert.ok(nativeCall, 'native install is called synchronously before yielding user activation');
   const url = new URL(nativeCall[1].packageUrl);
@@ -79,11 +91,13 @@ function signedBrowser(options = {}) {
   assert.equal(nativeCall[1].expectedSha256, signed.sha256);
   await pending;
   assert.equal(publicPage.status(), '安装成功。');
+  assert.equal(publicPage.nodes['#step-install'].dataset.state, 'done');
   assert.equal(publicPage.buttons(0)[0].textContent, '卸载');
   await publicPage.context.checkUpdate(signed);
   assert.equal(publicPage.status(), '安装成功。', 'signed route does not call legacy update APIs');
   await publicPage.context.uninstall(signed);
   assert.equal(publicPage.status(), '卸载成功。');
+  assert.equal(publicPage.nodes['#install-progress'].hidden, false, 'uninstall returns to the visible idle progress panel');
   assert.equal(publicPage.buttons(0)[0].textContent, '安装');
 
   for (const error of ['confirmation_cancelled', 'signed_extension_signature_invalid']) {
@@ -100,6 +114,7 @@ function signedBrowser(options = {}) {
   const unconfirmed = await page(signedBrowser({ badPostStatus: true }).chrome);
   await unconfirmed.context.install(signed);
   assert.match(unconfirmed.status(), /浏览器已完成安装，但安装状态未确认/);
+  assert.equal(unconfirmed.nodes['#install-progress'].dataset.result, 'unconfirmed');
   const badStatus = await page(signedBrowser({ badStatus: true }).chrome);
   assert.equal(badStatus.buttons(0).length, 0);
   assert.match(badStatus.status(), /安装状态读取失败/);
@@ -121,6 +136,94 @@ function signedBrowser(options = {}) {
   assert.equal(optional.buttons(0)[0].textContent, '卸载');
   await optional.context.uninstall(signed);
   assert.equal(optional.status(), '卸载成功。');
+
+  // Signed progress uses its own namespace and leaves the final callback in
+  // charge of success. Control timers so the tests exercise the in-flight path.
+  for (const outcome of ['success', 'cancel', 'query-error', 'lan-http']) {
+    const fixture = signedBrowser();
+    let finish;
+    const nativeInstall = fixture.chrome.nomadSignedExtensions.install;
+    fixture.chrome.nomadSignedExtensions.install = (details, callback) => {
+      fixture.calls.push(['pending-install', details]);
+      finish = () => {
+        if (outcome === 'cancel') {
+          fixture.chrome.runtime.lastError = { message: 'signed_extension_confirmation_cancelled' };
+          callback(); delete fixture.chrome.runtime.lastError;
+        } else nativeInstall(details, callback);
+      };
+    };
+    const operationId = outcome === 'lan-http' ? '11111111-1111-4111-9111-111111111111' : 'ee58ba18-4da6-4f70-9018-9d5981e0db14';
+    let snapshot = { operationId, operation: 'install', extensionId: signed.id,
+      stage: 'downloading', receivedBytes: 40, totalBytes: 100 };
+    fixture.chrome.nomadSignedExtensions.getOperationProgress = (id, callback) => {
+      assert.equal(id, operationId);
+      fixture.calls.push(['signed-progress', id]);
+      if (outcome === 'query-error') {
+        fixture.chrome.runtime.lastError = { message: 'host_unavailable' };
+        callback(); delete fixture.chrome.runtime.lastError;
+      } else callback({ progress: snapshot });
+    };
+    fixture.chrome.webstorePrivate = { getOperationProgress() { throw new Error('wrong namespace'); } };
+    const progressPage = await page(fixture.chrome, [signed]);
+    progressPage.context.window.crypto = outcome === 'lan-http'
+      ? { getRandomValues: bytes => bytes.fill(17) } : { randomUUID: () => operationId };
+    if (outcome === 'lan-http') progressPage.context.window.location.origin = 'http://192.168.1.10:18731';
+    const timers = new Map(); let sequence = 0;
+    progressPage.context.setTimeout = fn => { timers.set(++sequence, fn); return sequence; };
+    progressPage.context.clearTimeout = id => timers.delete(id);
+    async function tick() {
+      const [id, fn] = timers.entries().next().value;
+      timers.delete(id); await fn();
+    }
+    const installing = progressPage.context.install(signed);
+    const steps = () => ['#step-download', '#step-verify', '#step-install'].map(id => progressPage.nodes[id].dataset.state);
+    assert.deepEqual(steps(), ['active', 'pending', 'pending']);
+    assert.equal(fixture.calls.find(call => call[0] === 'pending-install')[1].operationId, operationId);
+    assert.equal(fixture.calls.filter(call => call[0] === 'signed-progress').length, 0,
+      'install starts synchronously before any polling');
+    await tick();
+    if (outcome === 'query-error') {
+      assert.match(progressPage.status(), /浏览器正在取包并校验发布签名/);
+      assert.equal(timers.size, 0, 'progress failure does not cancel installation');
+      assert.deepEqual(steps(), ['pending', 'pending', 'pending']);
+      assert.equal(progressPage.nodes['#install-progress'].dataset.result, 'pending');
+      assert.match(progressPage.nodes['#progress-note'].textContent, /host_unavailable.*安装仍在继续/);
+    } else {
+      assert.match(progressPage.status(), /40%/);
+      assert.equal(progressPage.nodes['#download-progress'].hidden, false);
+      snapshot = { ...snapshot, receivedBytes: 60 }; delete snapshot.totalBytes;
+      await tick();
+      assert.match(progressPage.status(), /已接收 60 B/);
+      assert.equal(progressPage.nodes['#download-progress'].value, undefined);
+      snapshot = { ...snapshot, receivedBytes: 100, totalBytes: 100 };
+      await tick();
+      assert.match(progressPage.status(), /100%/);
+      assert.doesNotMatch(progressPage.status(), /安装成功/);
+      assert.deepEqual(steps(), ['active', 'pending', 'pending'], 'download 100% is not install completion');
+      // Ignore stale or unrelated snapshots instead of moving another operation's UI.
+      for (const wrong of [{ operationId: 'other' }, { extensionId: ordinary.id }, { operation: 'update_check' }]) {
+        const previous = snapshot;
+        snapshot = { ...snapshot, stage: 'installing', ...wrong }; await tick();
+        assert.deepEqual(steps(), ['active', 'pending', 'pending']);
+        snapshot = previous;
+      }
+      for (const stage of ['verifying', 'awaiting_user_confirmation', 'installing', 'committing', 'rolling_back', 'completed']) {
+        snapshot = { ...snapshot, stage }; await tick();
+        assert.equal(progressPage.nodes['#status'].dataset.stage, stage);
+        assert.equal(progressPage.nodes['#download-progress'].hidden, true);
+        assert.doesNotMatch(progressPage.status(), /安装成功/);
+        assert.deepEqual(steps(), stage === 'verifying' ? ['done', 'active', 'pending'] : ['done', 'done', 'active']);
+        if (stage === 'awaiting_user_confirmation') assert.match(progressPage.nodes['#progress-note'].textContent, /等待浏览器权限确认/);
+      }
+    }
+    finish(); await installing;
+    assert.equal(timers.size, 0);
+    assert.equal(progressPage.nodes['#download-progress'].hidden, true);
+    assert.equal(progressPage.nodes['#status'].dataset.stage, undefined);
+    assert.match(progressPage.status(), outcome === 'cancel' ? /confirmation_cancelled/ : /安装成功/);
+    assert.deepEqual(steps(), outcome === 'cancel' ? ['done', 'done', 'cancelled'] : ['done', 'done', 'done']);
+    assert.equal(progressPage.nodes['#install-progress'].dataset.result, outcome === 'cancel' ? 'cancelled' : 'success');
+  }
 
   const disabled = await page(signedBrowser({ initialStatus: {
     extensionId: signed.id, state: 'disabled', version: signed.version,
@@ -221,5 +324,28 @@ function signedBrowser(options = {}) {
   assert.equal(context.formatBytes(841), '841 B');
   assert.equal(context.formatBytes(850944), '831 KB');
   assert.equal(context.formatBytes(undefined), '—');
-  console.log('PASS: signed HTTPS lifecycle, cancellation, receipt validation, platform selection and legacy install');
+
+  // Runtime links follow the current tunnel, removing stale URLs on failure.
+  const links = element();
+  context.document.querySelector = id => id === '#service-status' ? links : local.nodes[id];
+  let runtime = { localUrl: 'http://127.0.0.1:18731/', lanUrl: 'http://192.168.1.10:18731/',
+    tunnel: { state: 'starting', publicUrl: 'https://stale.example/' } };
+  context.fetch = async () => ({ ok: true, json: async () => runtime });
+  const linkTimers = new Map(); let nextTimer = 0;
+  context.setTimeout = fn => { linkTimers.set(++nextTimer, fn); return nextTimer; };
+  context.clearTimeout = id => linkTimers.delete(id);
+  const addresses = () => links.children.filter(item => item.tag === 'a').map(item => item.href);
+  await context.loadRuntime();
+  assert.deepEqual(addresses(), [runtime.localUrl, runtime.lanUrl]);
+  assert.ok(links.children.includes('公网隧道正在连接…'));
+  runtime.tunnel = { state: 'ready', publicUrl: 'https://active.example/' };
+  await context.loadRuntime();
+  assert.deepEqual(addresses(), [runtime.localUrl, runtime.lanUrl, runtime.tunnel.publicUrl]);
+  runtime.tunnel = { state: 'failed', publicUrl: 'https://active.example/' };
+  await context.loadRuntime();
+  assert.deepEqual(addresses(), [runtime.localUrl, runtime.lanUrl]);
+  runtime.lanUrl = 'javascript:alert(1)';
+  await context.loadRuntime();
+  assert.deepEqual(addresses(), [runtime.localUrl]);
+  console.log('PASS: signed HTTPS lifecycle, scoped progress, unknown length, fallback, cancellation, receipts and legacy install');
 })().catch(error => { console.error(error); process.exitCode = 1; });

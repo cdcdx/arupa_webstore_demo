@@ -18,6 +18,11 @@
       <a class="secondary-action" href="/docs">查看接口文档</a>
     </header>
 
+    <section class="service-panel" aria-labelledby="service-heading">
+      <h2 id="service-heading">访问地址</h2>
+      <div id="service-status" class="service-status" aria-live="polite">正在读取本机、局域网与公网链接…</div>
+    </section>
+
     <section class="panel" aria-labelledby="catalog-heading">
       <div class="toolbar">
         <div>
@@ -26,6 +31,15 @@
         </div>
         <button id="refresh" type="button">刷新插件列表</button>
       </div>
+      <section id="install-progress" class="install-progress" aria-labelledby="progress-heading" data-result="idle">
+        <h3 id="progress-heading">安装进度</h3>
+        <ol class="install-steps" aria-label="安装阶段">
+          <li id="step-download" data-state="pending"><span class="step-number" aria-hidden="true">1</span><span>下载</span></li>
+          <li id="step-verify" data-state="pending"><span class="step-number" aria-hidden="true">2</span><span>校验</span></li>
+          <li id="step-install" data-state="pending"><span class="step-number" aria-hidden="true">3</span><span>安装</span></li>
+        </ol>
+        <p id="progress-note" class="progress-note">选择插件并点击“安装”，这里将显示本次安装进度。</p>
+      </section>
       <div id="status" class="status" role="status" aria-live="polite">正在读取本地目录…</div>
       <progress id="download-progress" aria-label="CRX 下载进度" hidden></progress>
       <div class="table-wrap">

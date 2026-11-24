@@ -77,7 +77,21 @@ python3 server.py --open --browser /path/to/arupa-browser
 
 安装由点击直接触发 `install({ extensionId, packageUrl, expectedSha256 }, callback)`。包 URL 与页面同源，附带平台与 SHA-256，成功回执核对 ID、product 和版本，再通过 `getStatus` 确认已安装状态。状态查询的 product、version 为可选信息；刷新时不要求已安装产品标识与商店当前包一致，缺少版本时显示“已安装（版本未知）”。卸载使用同一命名空间的 `uninstall`，浏览器保留原生确认。包内元数据只是路由提示，发布签名和资源摘要仍必须由浏览器验证；商店不会给普通 CRX 伪造发布签名。
 
-这条签名通道目前没有取包进度或 `checkUpdate` 接口，网页只显示取包/验签提示并等待原结果回调；不能套用下面本机通道的百分比。已安装签名扩展出现新版时，页面提示手动卸载后重装，不自动卸载。
+新版 `chrome.nomadSignedExtensions.install()` 支持可选 `operationId`（每次操作新建一个非零 UUID，例如 `crypto.randomUUID()`）。在用户点击中直接传给 install，然后使用 `chrome.nomadSignedExtensions.getOperationProgress(operationId, callback)` 每 300 毫秒查询。install 回调仍返回最终结果；`getStatus()` 仍查询已安装/未安装/停用状态。
+
+查询返回 `{ progress?: { operationId, operation: 'install', extensionId, stage, receivedBytes, totalBytes?, errorCode? } }`。下载字节来自浏览器宿主实际读取的包数据；总大小未知时省略 totalBytes，Demo 显示已接收字节和不定进度。仅 downloading 阶段计算百分比；100% 表示下载完毕，随后仍需验签、兼容性预检、权限确认、安装和提交。失败/取消发生回滚时，先显示 rolling_back，再进入 failed/cancelled，只有 completed 和 install 成功回调表示安装完成。
+
+任务绑定 Profile、来源和发起文档；其他来源、标签页、刷新后的文档查询不到旧任务，隐身页面不可用。不存在、过期或不属于当前文档的任务返回 `{}`；终态最长保留两分钟，缓存最多 128 条，必要时提前清除较早终态。不要复用 operationId。查询不需要额外用户点击，但安装和卸载仍需真实用户点击及原生确认。
+
+本 Demo 的签名通道使用 `nomadSignedExtensions.getOperationProgress()`，本机普通目录通道使用 `webstorePrivate.getOperationProgress()`，两者按实际安装通道独立查询。旧版没有签名进度方法时继续等待最终回调，不传 operationId；查询失败也不会终止安装。浏览器顶部/标签加载条仍来自页面导航事件，与扩展安装进度无关。
+
+安装页显示“下载 → 校验 → 安装”三步阶段条：取包对应下载，验包与兼容性检查对应校验，权限确认、安装与提交对应安装；等待权限时明确提示确认后才会安装。轮询可能跳过短暂阶段。成功、失败和取消均保留原回调结果；只有最终回调成功并完成回执核对后，阶段条才显示完成。旧版浏览器不模拟阶段或百分比。目录通道准备升级包时只完成前两步，点击“升级”后才进入安装。
+
+阶段条在安装前也保持可见，点击安装后自动滚动到该区域，避免在列表下方操作时看不到进度。页面会提示当前安装通道是否缺少进度接口；进度查询报错也会显示原因，安装仍等待原回调。局域网 HTTP 测试页没有 `crypto.randomUUID()` 时，Demo 使用 `crypto.getRandomValues()` 生成 UUID v4，不会因此关闭已有的进度查询能力。仅刷新网站不会给旧版浏览器增加原生进度接口。
+
+例如 AI 搜片独立安装页还适配了 `window.nomad.installation` 的 `onProgress` / `list` 任务协议；它与 `chrome.nomadSignedExtensions` 是不同的接口。该协议在目标浏览器中的可用性和任务字段须单独确认，本 Demo 尚未接入。
+
+签名通道目前也没有 `checkUpdate` 接口。已安装签名扩展出现新版时，页面提示手动卸载后重装，不自动卸载。
 
 目录与下载均按 `platform=desktop|android` 选包（默认 desktop）。MiVPN 依据包内实际引擎区分平台，先过滤平台再选同 ID 的最高版本，避免把 Android 0.0.48 送到桌面端而漏掉桌面 0.0.34。通用签名扩展默认列在两个平台，最终兼容性由浏览器校验。
 

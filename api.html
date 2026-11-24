@@ -46,11 +46,15 @@
     <p>Demo 优先为含发布签名元数据的包选择 <code>chrome.nomadSignedExtensions</code>。页面必须是顶层 HTTPS 页面，取包 URL 必须同源；浏览器匿名取包且不跟随重定向。仅有普通 CRX3 作者签名的包不能走此通道，网页也不能代替发布方签名。</p>
     <pre><code>// 点击事件内立即调用，不要先 await fetch 或延迟调用。
 const packageUrl = new URL('/api/package', location.origin);
+const api = chrome.nomadSignedExtensions;
+const operationId = typeof api.getOperationProgress === 'function'
+  ? crypto.randomUUID() : null; // 兼容旧版
 packageUrl.searchParams.set('id', item.id);
 packageUrl.searchParams.set('platform', 'desktop'); // Android 页面用 android
 packageUrl.searchParams.set('sha256', item.sha256);
 chrome.nomadSignedExtensions.install({
-  extensionId: item.id, packageUrl: packageUrl.href, expectedSha256: item.sha256
+  extensionId: item.id, packageUrl: packageUrl.href, expectedSha256: item.sha256,
+  ...(operationId &amp;&amp; { operationId })
 }, result =&gt; {
   if (chrome.runtime.lastError) return; // 失败/取消均保留原错误
   // 校验 result.extensionId、product、version 与目录相符，再查 getStatus。
@@ -66,7 +70,43 @@ chrome.nomadSignedExtensions.uninstall(item.id, () =&gt; {
   if (!chrome.runtime.lastError) location.reload();
 });</code></pre>
     <p><code>getStatus</code> 的 product、version 是可选信息，描述当前已安装的扩展，不要求等于商店当前包的元数据。页面严格核对 extensionId 和 state；缺少版本时显示“已安装（版本未知）”并暂停版本比较。install 的成功回执仍须与本次所选包的 ID、产品和版本一致。</p>
-    <p>install 回调成功表示整次安装完成，不再调用 completeInstall；Demo 还会重新查询并核对安装状态。此通道目前没有进度查询、checkUpdate 或 applyUpdate，不能复用下述 webstorePrivate 的进度接口；网页显示取包/验签等待提示，出现新版时提示手动卸载后重装。以下章节描述本机目录通道。</p>
+    <p>install 回调成功表示整次安装完成，不再调用 completeInstall；Demo 还会重新查询并核对安装状态。新版增加可选 operationId 和独立进度查询，getStatus 仍只查询安装状态。签名通道没有 checkUpdate 或 applyUpdate；出现新版时提示手动卸载后重装。</p>
+  </section>
+
+  <section>
+    <h2>签名通道：查询真实安装进度</h2>
+    <p>阶段条在安装前保持可见，开始安装时自动滚动到进度区。浏览器缺少查询接口时会明确提示；局域网 HTTP 测试页缺少 crypto.randomUUID 时，Demo 使用 crypto.getRandomValues 生成 UUID v4。查询报错会展示原因，并继续等待原安装回调。</p>
+    <p>商店页面以“下载 → 校验 → 安装”展示阶段。取包对应下载，校验与兼容性检查对应校验，权限确认及后续写入对应安装；权限窗口期间明确显示“等待浏览器权限确认”。百分比仅用于下载，不用固定百分比模拟校验或安装。旧版浏览器没有查询接口时只显示等待提示，最终成功、失败、取消仍由原回调决定。</p>
+    <pre><code>// install 发出后轮询，建议间隔 300 毫秒；最终回调到达后停止。
+chrome.nomadSignedExtensions.getOperationProgress(operationId, result =&gt; {
+  if (chrome.runtime.lastError) return; // 查询失败不代表安装失败
+  const p = result?.progress;
+  if (!p || p.operationId !== operationId || p.extensionId !== item.id) return;
+  if (p.stage === 'downloading') {
+    if (p.totalBytes &gt; 0) {
+      const downloadPercent = Math.min(100, Math.floor(100 * p.receivedBytes / p.totalBytes));
+      // 只表示下载百分比；没有 totalBytes 时显示已接收字节和不定进度。
+    }
+  } else {
+    // 按 p.stage 显示阶段，不能把下载 100% 当作安装成功。
+  }
+});</code></pre>
+    <p>返回结构为 <code>{ progress?: { operationId, operation: 'install', extensionId, stage, receivedBytes, totalBytes?, errorCode? } }</code>。阶段依次可能出现 preparing、downloading、verifying、preflight、opening_confirmation、awaiting_user_confirmation、installing、committing；需要回滚时为 rolling_back，终态为 completed、failed 或 cancelled。轮询可能跳过短暂阶段。下载数据来自宿主实际读取的字节，总大小未知时不提供 totalBytes。最终结果仍以 install 回调和 runtime.lastError 为准。</p>
+    <p>operationId 必须是每次新建的非零 UUID。任务同时绑定 Profile、来源和发起文档，查询不需要用户激活；跨来源、其他标签页、刷新后的文档和已清理任务返回空对象。隐身或失效文档被拒绝。终态最多保留两分钟，缓存最多 128 条，容量不足时提前清除旧终态；不持久化。旧版没有此方法时不要传 operationId，继续等待 install 回调。进度查询失败时停止轮询并保留原安装等待流程。</p>
+  </section>
+
+  <section>
+    <h2>Demo 百分比与标签进度的来源</h2>
+    <table>
+      <thead><tr><th>显示或调用</th><th>实际数据来源</th><th>与签名 install 的关系</th></tr></thead>
+      <tbody>
+        <tr><td>Demo 中“正在下载 CRX · … · xx%”</td><td>签名通道用 <code>nomadSignedExtensions.getOperationProgress</code>；本机普通目录通道用 <code>webstorePrivate.getOperationProgress</code>。</td><td>按实际通道查询 receivedBytes / totalBytes；下载 100% 后继续显示校验和安装阶段。</td></tr>
+        <tr><td>浏览器顶部或标签的页面加载进度</td><td>浏览器的页面导航加载事件。</td><td>不是 CRX 字节进度，不能据此判断插件已下载、校验或安装完成。</td></tr>
+        <tr><td>独立业务安装页的任务进度</td><td>该页面自己的任务协议或阶段展示。例如 AI 搜片安装页适配 <code>window.nomad.installation.onProgress / list</code>。</td><td>是另一份接口合同，须确认目标版本是否提供；本 Demo 尚未接入这一协议。</td></tr>
+        <tr><td><code>nomadSignedExtensions.install</code> 回调</td><td>本次安装的最终结果或 runtime.lastError。</td><td>进度使用新增的 getOperationProgress 单独轮询；getStatus 是安装状态查询。</td></tr>
+      </tbody>
+    </table>
+    <p>Demo 根据包元数据和页面中实际可用的 API 选择安装通道。公网/本机地址、CRX 文件名、进度条外观或标签标题，都不能单独证明具体调用了哪条接口。以下章节描述 webstorePrivate 目录通道。</p>
   </section>
 
   <section>
@@ -99,7 +139,7 @@ chrome.nomadSignedExtensions.uninstall(item.id, () =&gt; {
   </section>
 
   <section>
-    <h2>查询取包进度</h2>
+    <h2>本机目录通道：查询取包进度</h2>
     <p>若浏览器提供 <code>chrome.webstorePrivate.getOperationProgress</code>，点击时用 <code>crypto.randomUUID()</code> 生成本次操作的 <code>operationId</code>。新装将它放入 <code>beginInstallWithManifest3</code> 的详情对象，更新检查用 <code>checkUpdate(id, { operationId }, callback)</code>。在原回调完成前，从发起操作的同一页面调用 <code>getOperationProgress(operationId, callback)</code>，建议间隔 300 毫秒。旧浏览器沿用原调用形式。</p>
     <pre><code>{ progress: { operationId, operation, extensionId, stage, receivedBytes, totalBytes? } }</code></pre>
     <p><code>operation</code> 为 <code>install</code> 或 <code>update_check</code>。阶段包括 <code>preparing</code>、<code>downloading</code>、<code>verifying</code>。新装还可进入 <code>opening_confirmation</code>、<code>awaiting_user_confirmation</code>。总大小未知时省略 <code>totalBytes</code>；操作尚未开始或已结束时返回 <code>{}</code>。命中更新暂存包时直接校验。安装批准、更新检查结果、错误和取消仍由原回调处理。</p>

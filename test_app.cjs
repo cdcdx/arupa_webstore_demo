@@ -20,13 +20,13 @@ function element(tag = '') {
     insertCell() { const cell = element('td'); this.append(cell); return cell; },
   };
 }
-async function page(chrome = {}, items = [signed, ordinary], userAgent = 'Desktop') {
+async function page(chrome = {}, items = [signed, ordinary], userAgent = 'Desktop', maxTouchPoints = 0) {
   const nodes = Object.fromEntries(['#packages', '#status', '#refresh', '#download-progress',
     '#install-progress', '#progress-heading', '#progress-note', '#step-download', '#step-verify', '#step-install']
     .map(id => [id, element()]));
   const requests = [];
   const context = { document: { querySelector: id => nodes[id], createElement: element },
-    window: { chrome, navigator: { userAgent }, location: { origin: 'https://store.example' } },
+    window: { chrome, navigator: { userAgent, maxTouchPoints }, location: { origin: 'https://store.example' } },
     chrome, URL, AbortController, setTimeout, clearTimeout,
     fetch: async url => { requests.push(url); return { ok: true, json: async () => ({ packages: items, errors: [] }) }; },
   };
@@ -253,6 +253,21 @@ function signedBrowser(options = {}) {
   await mobile.context.install(signed);
   assert.equal(new URL(mobileBrowser.calls.find(call => call[0] === 'install')[1].packageUrl).searchParams.get('platform'), 'android');
 
+  const iosItem = { ...signed, platforms: ['ios'] };
+  for (const [agent, touches] of [['Mozilla/5.0 (iPhone)', 0], ['Mozilla/5.0 (iPad)', 0],
+    ['Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)', 5]]) {
+    const fixture = signedBrowser();
+    const iosPage = await page(fixture.chrome, [iosItem], agent, touches);
+    assert.equal(iosPage.requests[0], '/api/catalog?platform=ios');
+    assert.equal(iosPage.buttons(0)[0].textContent, '安装');
+    assert.equal(iosPage.nodes['#packages'].children[0].children[0].children[1].textContent, '平台提示：iOS');
+    await iosPage.context.install(iosItem);
+    assert.equal(new URL(fixture.calls.find(call => call[0] === 'install')[1].packageUrl).searchParams.get('platform'), 'ios');
+    assert.equal(iosPage.status(), '安装成功。');
+  }
+  const iosOnDesktop = await page(signedBrowser().chrome, [iosItem], 'Macintosh');
+  assert.equal(iosOnDesktop.buttons(0)[0].textContent, '安装', 'platform hints never hide packages or remove install entry');
+
   const legacyCalls = [];
   const legacy = { runtime: {}, management: { getAll: cb => cb([]) }, webstorePrivate: {
     beginInstallWithManifest3(details, cb) { legacyCalls.push(['begin', details]); cb(''); },
@@ -380,6 +395,8 @@ function signedBrowser(options = {}) {
     /5 条默认启用规则需要“响应头匹配”，但不能仅凭此断定失败原因/);
   assert.match(context.installErrorMessage(new Error('dnr_kernel_capability_unavailable'), adguard), /内核缺少/);
   assert.match(context.installErrorMessage(new Error('dnr_package_invalid'), ordinary), /具体原因尚未确认/);
+  assert.match(context.installErrorMessage(new Error('signed_extension_restart_required'), ordinary),
+    /完全退出并重新启动浏览器/);
   assert.equal(context.installErrorMessage(new Error('user_cancelled'), adguard), '安装失败：user_cancelled');
   assert.equal(context.formatBytes(841), '841 B');
   assert.equal(context.formatBytes(850944), '831 KB');

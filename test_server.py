@@ -41,13 +41,12 @@ class LocalCrxCatalogTests(unittest.TestCase):
                 archive.writestr(stem + ".sig", bytes(signature_size))
         return prefix + stream.getvalue()
 
-    def test_renamed_mivpn_products_filter_before_version_selection(self):
+    def test_platform_hint_does_not_hide_newest_same_id_package(self):
         identity = crx_catalog.crx_id((server.PACKAGES / "nomad-demo-1.0.crx").read_bytes())
         cases = [("mivpn-desktop", "desktop", "1.0"), ("mivpn-android", "android", "2.0"),
                  ("mivpn-ios", "ios", "3.0")]
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            raw = {}
+            root = Path(temporary); raw = {}
             for product, platform, version in cases:
                 raw[platform] = self.mivpn_catalog_fixture(ordinary=True, platform=platform,
                     product=product, version=version, extension_id=identity, stem="META-INF/nomad-package")
@@ -56,21 +55,17 @@ class LocalCrxCatalogTests(unittest.TestCase):
             thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
             connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
             try:
-                for platform, version in [("desktop", "1.0"), ("android", "2.0")]:
+                for platform in ("desktop", "android", "ios"):
                     connection.request("GET", "/api/catalog?platform=" + platform)
-                    response = connection.getresponse()
-                    self.assertEqual(response.status, 200)
+                    response = connection.getresponse(); self.assertEqual(response.status, 200)
                     item, = json.loads(response.read())["packages"]
-                    self.assertEqual((item["version"], item["platforms"]), (version, [platform]))
+                    self.assertEqual((item["version"], item["platforms"]), ("3.0", ["ios"]))
                     connection.request("GET", f'/api/package?id={identity}&platform={platform}&sha256={item["sha256"]}')
-                    response = connection.getresponse()
-                    self.assertEqual(response.status, 200)
-                    self.assertEqual(response.read(), raw[platform])
-                    # The newer iOS candidate and other platform must not replace this release.
-                    wrong = crx_catalog.read_package(root / ("android.crx" if platform == "desktop" else "ios.crx"))
-                    connection.request("GET", f'/api/package?id={identity}&platform={platform}&sha256={wrong.sha256}')
-                    response = connection.getresponse()
-                    self.assertEqual(response.status, 409); response.read()
+                    response = connection.getresponse(); self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), raw["ios"])
+                    old = crx_catalog.read_package(root / "desktop.crx")
+                    connection.request("GET", f'/api/package?id={identity}&platform={platform}&sha256={old.sha256}')
+                    response = connection.getresponse(); self.assertEqual(response.status, 409); response.read()
             finally:
                 connection.close(); httpd.shutdown(); httpd.server_close(); thread.join()
 
@@ -85,19 +80,34 @@ class LocalCrxCatalogTests(unittest.TestCase):
                     self.assertEqual(crx_catalog.signed_package_metadata(raw, crx_catalog.extract_manifest(raw)),
                                      ("publisher-renamed-addon", expected))
 
-    def test_mivpn_without_supported_engine_is_not_listed(self):
+    def test_ios_package_is_visible_and_downloadable_on_every_platform(self):
         identity = crx_catalog.crx_id((server.PACKAGES / "nomad-demo-1.0.crx").read_bytes())
         raw = self.mivpn_catalog_fixture(ordinary=True, product="mivpn-ios", platform="ios",
             extension_id=identity, stem="META-INF/nomad-package")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); (root / "ios.crx").write_bytes(raw)
-            index = crx_catalog.CatalogIndex(root)
-            for platform in ("desktop", "android"):
-                self.assertEqual(index.get(platform), ([], []))
-            package, = index.get()[0]
-            self.assertEqual(package.platforms, ())
+            httpd = server.DemoServer(("127.0.0.1", 0), root)
+            for platform in (None, "desktop", "android", "ios"):
+                packages, errors = httpd.catalog.get(platform)
+                self.assertEqual(errors, []); self.assertEqual(len(packages), 1)
+                self.assertEqual(packages[0].platforms, ("ios",))
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+            connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
+            try:
+                for platform in (None, "desktop", "android", "ios"):
+                    suffix = "" if platform is None else "?platform=" + platform
+                    connection.request("GET", "/api/catalog" + suffix)
+                    response = connection.getresponse(); self.assertEqual(response.status, 200)
+                    item, = json.loads(response.read())["packages"]
+                    self.assertEqual(item["signedProduct"], "mivpn-ios")
+                    suffix = "" if platform is None else "&platform=" + platform
+                    connection.request("GET", f'/api/package?id={identity}&sha256={item["sha256"]}' + suffix)
+                    response = connection.getresponse(); self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), raw)
+            finally:
+                connection.close(); httpd.shutdown(); httpd.server_close(); thread.join()
 
-    def test_platform_filter_precedes_version_selection_and_download_is_pinned(self):
+    def test_global_version_selection_and_download_pinning_ignore_platform(self):
         desktop = self.mivpn_catalog_fixture(version="0.0.34")
         android = self.mivpn_catalog_fixture(platform="android", version="0.0.48")
         with tempfile.TemporaryDirectory() as temporary:
@@ -109,23 +119,23 @@ class LocalCrxCatalogTests(unittest.TestCase):
             thread.start()
             connection = http.client.HTTPConnection(*httpd.server_address)
             try:
-                for platform, version, raw in (("desktop", "0.0.34", desktop), ("android", "0.0.48", android)):
+                for platform in ("desktop", "android", "ios"):
                     connection.request("GET", "/api/catalog?platform=" + platform)
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     package, = json.loads(response.read())["packages"]
                     self.assertEqual((package["version"], package["signedProduct"], package["platforms"]),
-                                     (version, "mivpn", [platform]))
+                                     ("0.0.48", "mivpn", ["android"]))
                     route = f'/api/package?id={package["id"]}&platform={platform}&sha256={package["sha256"]}'
                     connection.request("GET", route)
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
-                    self.assertEqual(response.read(), raw)
+                    self.assertEqual(response.read(), android)
                     connection.request("GET", route.replace(package["sha256"], "0" * 64))
                     response = connection.getresponse()
                     self.assertEqual(response.status, 409)
                     self.assertEqual(response.read(), b"package_changed")
-                for route in ("/api/catalog?platform=ios", "/api/catalog?platform=desktop&platform=android",
+                for route in ("/api/catalog?platform=watchos", "/api/catalog?platform=desktop&platform=android",
                               f"/api/package?id={crx_catalog.MIVPN_ID}&sha256=invalid"):
                     connection.request("GET", route)
                     response = connection.getresponse()
@@ -148,7 +158,7 @@ class LocalCrxCatalogTests(unittest.TestCase):
                 archive.writestr("META-INF/nomad-package.json", json.dumps(metadata))
                 archive.writestr("META-INF/nomad-package.sig", bytes(signature_size))
             self.assertEqual(crx_catalog.signed_package_metadata(prefix + memory.getvalue(), manifest),
-                             (product, ("desktop", "android")))
+                             (product, crx_catalog.PLATFORMS))
 
     def test_mivpn_uses_inner_install_id_and_http_preserves_crx_bytes(self):
         raw = self.mivpn_catalog_fixture()

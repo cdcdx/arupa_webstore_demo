@@ -55,6 +55,7 @@ h1 span { color: var(--brand); }
 h2 { margin: 0; font-size: 24px; letter-spacing: -.02em; }
 
 .intro { max-width: 680px; margin: 16px 0 0; color: var(--muted); font-size: 17px; }
+.catalog-note { max-width: 680px; margin: 10px 0 0; color: var(--muted); font-size: 13px; }
 
 .panel {
   overflow: hidden;

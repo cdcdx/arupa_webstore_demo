@@ -39,8 +39,9 @@
 
 <section id="http-api" aria-labelledby="http-api-heading"><h2 id="http-api-heading">网站 HTTP 接口</h2>
 <p>以下接口只读，不执行安装。无效请求返回 HTTP 状态和 <code>text/plain</code> 错误码；成功的目录、存活和运行状态返回 JSON。</p><div class="table-wrap"><table><thead><tr><th scope="col">方法与路径</th><th scope="col">参数</th><th scope="col">响应</th></tr></thead><tbody>
-<tr><td><code>GET /api/catalog</code></td><td>platform 可选，desktop 或 android，默认 desktop；重复或空 platform 非法</td><td>200：<code>{packages: Package[], errors: CatalogError[]}</code>；400：invalid_platform</td></tr>
-<tr><td><code>GET /api/package</code></td><td>id 必填，32 位 a–p；platform 可选，默认 desktop；sha256 可选，64 位小写十六进制</td><td>200：CRX 字节；400：invalid_extension_id / invalid_package_request；404：package_not_found；409：package_changed</td></tr>
+<tr><td><code>GET /api/catalog</code></td><td>platform 可选，desktop / android / ios，默认 desktop；仅作客户端提示，不过滤目录；重复或空值非法</td><td>200：<code>{packages: Package[], errors: CatalogError[]}</code>；400：invalid_platform</td></tr>
+<tr><td><code>GET /api/package</code></td><td>id 必填，32 位 a–p；platform 可选，desktop / android / ios，默认 desktop；不限制取包；sha256 可选，64 位小写十六进制；支持单段 Range 与强 ETag If-Range</td><td>200：整包；206：分段 CRX；400：invalid_extension_id / invalid_package_request；404：package_not_found；409：package_changed；416：range_not_satisfiable</td></tr>
+<tr><td><code>HEAD /api/package</code></td><td>查询参数同 GET；忽略 Range</td><td>200：整包头信息、Accept-Ranges 和 ETag，无包体；参数及摘要错误同 GET</td></tr>
 <tr><td><code>GET /api/health</code></td><td>无参数</td><td>200：<code>{status: "ok", service: "arupa-webstore-demo"}</code></td></tr>
 <tr><td><code>GET /api/runtime</code></td><td>无参数</td><td>200：service、instanceId、localUrl、lanUrl、tunnel</td></tr>
 <tr><td><code>GET /</code>、<code>GET /docs</code></td><td>无参数；仅前端 hash 锚点不影响路径</td><td>商店页 / 本接口说明；未知路径 404 not_found</td></tr>
@@ -49,12 +50,33 @@
 <tr><td>manifest</td><td>object</td><td>包内 MV3 清单；目录通道按此预览与实际包比较</td></tr>
 <tr><td>sha256 / size / file</td><td>string / number / string</td><td>完整 CRX 的 SHA-256、字节数、原文件名；size ≤ 128 MiB</td></tr>
 <tr><td>signedProduct</td><td>string 或 null</td><td>发布清单元数据提示，不是已验签结论</td></tr>
-<tr><td>platforms</td><td>string[]</td><td>目录路由平台；MiVPN 按实际引擎过滤后再选同 ID 最高版本</td></tr>
+<tr><td>platforms</td><td>string[]</td><td>兼容性提示，可含 desktop / android / ios；不限制展示或安装入口，同 ID 仍选全局最高版本</td></tr>
 <tr><td>requirements</td><td>object</td><td>可含 responseStageRules；缺失不证明无相关规则，存在也不等于兼容性判定</td></tr>
 <tr><td>errors[]</td><td><code>{file: string, error: string}[]</code></td><td>无效 CRX 的文件名和原因；其他有效包继续返回</td></tr>
-</tbody></table></div><p>MiVPN 旧格式、mivpn 与 mivpn-* 产品按引擎判定平台；含对应引擎的自定义产品名同样适用。iOS-only 包不进入 desktop/android 目录，普通通用扩展默认两端。只扫描 packages 第一层 *.crx，目录和下载复用服务级缓存，文件变化后重新解析。</p><pre><code id="example-http" data-language="shell">curl &#x27;http://127.0.0.1:18731/api/catalog?platform=desktop&#x27;
+</tbody></table></div><p>桌面、Android、iOS 包统一展示，所有有效 platform 提示返回相同目录。MiVPN 保留引擎和产品元数据推导的平台标签；mivpn-ios 标记 iOS，不要求包内携带桌面或 Android 引擎。通用扩展默认三个平台提示，标签不代表已完成原生兼容性验收。只扫描 packages 第一层 *.crx；服务级缓存、同 ID 最高版本选择和 SHA-256 锁定继续有效。当前浏览器是否提供安装接口及能否通过原生验证，决定实际安装结果。</p><pre><code id="example-http" data-language="shell">curl &#x27;http://127.0.0.1:18731/api/catalog?platform=desktop&#x27;
 # 将 ID 和摘要替换为上一条目录响应的值；不直接用 file 字段拼路径。
-curl -f &#x27;http://127.0.0.1:18731/api/package?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;platform=desktop&amp;sha256=目录返回的摘要&#x27; -o extension.crx</code></pre><h3>取包与网络约束</h3><p>包响应类型为 <code>application/x-chrome-extension</code>。服务先以不超过 64 KiB 的读取校验摘要，再从同一打开文件分块发送。原子替换不会切换已打开的下载；发送前检测到变化返回 409，发送中发现原地改写或截断会中止连接。不要把部分包体当作下载完成。</p><p>响应使用 no-store、nosniff 和同源 CSP。Host/端口及跨站子资源请求受限制，403 返回 forbidden；未开放跨域 CORS。页面、health、runtime 和静态资源不接受 query 参数。CRX 可省略 Content-Length，因此下载必须支持未知总大小。</p><h3>运行地址结构</h3><pre><code id="example-runtime" data-language="json">{
+curl -f &#x27;http://127.0.0.1:18731/api/package?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;platform=desktop&amp;sha256=目录返回的摘要&#x27; -o extension.crx</code></pre><h3>取包与断点续传</h3><p>包响应类型为 <code>application/x-chrome-extension</code>。服务先以不超过 64 KiB 的读取校验整个文件的摘要，再定位同一打开文件并分块发送所需字节。原子替换不会切换已打开的下载；发送前检测到变化返回 409，发送中发现原地改写或截断会中止连接。不要把部分包体当作下载完成。</p>
+<div class="table-wrap"><table><thead><tr><th scope="col">请求或响应头</th><th scope="col">当前行为</th></tr></thead><tbody>
+<tr><td><code>Range: bytes=N-M</code> / <code>bytes=N-</code> / <code>bytes=-N</code></td><td>支持单段闭区间、从偏移到结尾、末尾 N 字节。有效区间返回 206；结束偏移超过文件末尾时截到末尾。</td></tr>
+<tr><td><code>Content-Range</code> / <code>Content-Length</code></td><td>206 返回 <code>bytes 起点-终点/完整大小</code>，起止均包含；Content-Length 是本次分段长度。416 返回 <code>bytes */完整大小</code>，正文为 range_not_satisfiable。</td></tr>
+<tr><td><code>Accept-Ranges: bytes</code> / <code>ETag</code></td><td>200、206、416 与成功 HEAD 均提供。ETag 是用双引号包围的完整文件 SHA-256，为强校验器。</td></tr>
+<tr><td><code>If-Range</code></td><td>仅支持一个与当前 ETag 完全匹配的强 ETag。弱 ETag、日期值、不匹配或重复值均忽略 Range，返回整包 200；没有发送 Last-Modified。</td></tr>
+<tr><td>未带 Range / 不支持的 Range</td><td>整包 200；畸形、逆序、多段、重复 Range 字段或未知单位均忽略。合法但不可满足的区间（包括起点超出末尾、末尾 0 字节）返回 416。</td></tr>
+<tr><td><code>HEAD</code> / 未知大小模式</td><td>HEAD 忽略 Range，只返回整包头、无正文。--package-without-length 只省略整包 Content-Length，206 始终带分段长度。</td></tr>
+</tbody></table></div>
+<p>客户端收到 206 后，先核对 Content-Range 的起点等于本地已保存长度，再追加包体；收到 200 必须清空旧临时文件后写入整包。409 应刷新目录并重新下载。416 不能直接视为成功，须核对本地长度及完整 SHA-256。恢复完成后仍须验证整个包的摘要和签名。成功、失败、取消继续由浏览器原安装回调报告，网页不用自行下载或拼接 CRX。</p>
+<pre><code id="example-range" data-language="http">GET /api/package?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1
+Range: bytes=262144-
+If-Range: "原响应的64位SHA256"
+
+HTTP/1.0 206 Partial Content
+Content-Type: application/x-chrome-extension
+Accept-Ranges: bytes
+ETag: "原响应的64位SHA256"
+Content-Range: bytes 262144-1048575/1048576
+Content-Length: 786432</code></pre>
+<p>上述为 1 MiB 文件的协议示意；实际 ETag、起点与完整大小应取原下载响应和本地文件。单段范围与校验器语义参见 <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-range">RFC 9110</a>。</p>
+<h3>网络约束</h3><p>响应使用 no-store、nosniff 和同源 CSP；CRX 额外使用 no-transform。Host/端口及跨站子资源请求受限制，403 返回 forbidden；未开放跨域 CORS。页面、health、runtime 和静态资源不接受 query 参数。整包 CRX 可省略 Content-Length，因此下载必须支持未知总大小。</p><h3>运行地址结构</h3><pre><code id="example-runtime" data-language="json">{
   &quot;service&quot;: &quot;arupa-webstore-demo&quot;,
   &quot;instanceId&quot;: &quot;服务实例标识&quot;,
   &quot;localUrl&quot;: &quot;http://127.0.0.1:18731/&quot;,
@@ -165,6 +187,13 @@ async function readBrowser(api, method, ...args) {
   } finally { clearTimeout(timer); }
 }
 
+function currentClientPlatform() {
+  const agent = window.navigator?.userAgent || '';
+  if (/iPad|iPhone|iPod/i.test(agent) ||
+      /Macintosh/i.test(agent) &amp;&amp; (window.navigator?.maxTouchPoints || 0) &gt; 1) return 'ios';
+  return /Android/i.test(agent) ? 'android' : 'desktop';
+}
+
 function newOperationId() {
   const crypto = window.crypto;
   if (typeof crypto?.randomUUID === &#x27;function&#x27;) return crypto.randomUUID();
@@ -243,7 +272,7 @@ function validateSignedStatus(item, status) {
   const operationId = typeof api.getOperationProgress === &#x27;function&#x27; ? newOperationId() : null;
   const url = new URL(&#x27;/api/package&#x27;, window.location.origin);
   url.searchParams.set(&#x27;id&#x27;, item.id);
-  url.searchParams.set(&#x27;platform&#x27;, /Android/i.test(navigator.userAgent) ? &#x27;android&#x27; : &#x27;desktop&#x27;);
+  url.searchParams.set(&#x27;platform&#x27;, currentClientPlatform());
   url.searchParams.set(&#x27;sha256&#x27;, item.sha256);
 
   // Promise executor 同步调用原生 API，前面没有 await，保留真实点击激活。
@@ -337,7 +366,7 @@ async function bindSignedInstall() {
   const button = document.querySelector(&#x27;#install&#x27;);
   const output = document.querySelector(&#x27;#install-status&#x27;);
   button.disabled = true;
-  const platform = /Android/i.test(navigator.userAgent) ? &#x27;android&#x27; : &#x27;desktop&#x27;;
+  const platform = currentClientPlatform();
   const response = await fetch(&#x27;/api/catalog?platform=&#x27; + platform, { cache: &#x27;no-store&#x27; });
   if (!response.ok) throw new Error(&#x27;目录 HTTP &#x27; + response.status);
   const { packages } = await response.json();

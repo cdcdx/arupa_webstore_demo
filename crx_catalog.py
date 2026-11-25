@@ -26,6 +26,7 @@ MAX_DIAGNOSTIC_RULE_BYTES = 32 * 1024 * 1024
 MAX_DIAGNOSTIC_TOTAL_BYTES = 64 * 1024 * 1024
 ID_RE = re.compile(r"[a-p]{32}\Z")
 MIVPN_ID = "objojdkhlcekcnhaeoebojmffolmafll"
+PLATFORMS = ("desktop", "android", "ios")
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,7 @@ class Package:
     size: int
     requirements: dict
     signed_product: str | None = None
-    platforms: tuple[str, ...] = ("desktop", "android")
+    platforms: tuple[str, ...] = PLATFORMS
 
     def public(self) -> dict:
         return {
@@ -271,33 +272,35 @@ def signed_package_metadata(data: bytes, manifest: dict) -> tuple[str | None, tu
         stem = next((name for name in ("META-INF/nomad-package", "META-INF/mivpn-package")
                      if name + ".json" in names), None)
         if stem is None:
-            return None, ("desktop", "android")
+            return None, PLATFORMS
         try:
             inventory = archive.getinfo(stem + ".json")
             signature = archive.getinfo(stem + ".sig")
             if inventory.file_size > MAX_MANIFEST_BYTES or signature.file_size != 64:
-                return None, ("desktop", "android")
+                return None, PLATFORMS
             metadata = json.loads(archive.read(inventory))
         except (KeyError, ValueError):
-            return None, ("desktop", "android")
+            return None, PLATFORMS
         product = metadata.get("product") if isinstance(metadata, dict) else None
         if (not isinstance(product, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", product)
                 or metadata.get("schema") != 1 or metadata.get("version") != manifest["version"]
                 or metadata.get("extensionId") != install_id(data, manifest)):
-            return None, ("desktop", "android")
-        platforms = ("desktop", "android")
+            return None, PLATFORMS
+        platforms = PLATFORMS
         files = {item.filename for item in archive.infolist() if not item.is_dir() and item.file_size > 0}
         desktop = bool(files.intersection({"engine/win-x64/mivpn-browser.dll",
             "engine/mac-arm64/mivpn-browser.dylib", "engine/mac-x64/mivpn-browser.dylib",
             "engine/linux-x64/libmivpn-browser.so"}))
         android = "engine/classes.dex" in files or any(
             name.startswith("engine/lib/") and name.endswith(".so") for name in files)
+        ios = product == "mivpn-ios" or any(name.startswith("engine/ios-") for name in files)
         # Product names are metadata, not an authentication or platform boundary.
         # Recognize the legacy format and renamed products, including iOS-only
-        # packages with no supported desktop/Android engine. Engine-bearing
+        # packages whose engine is provided by the iOS host. Engine-bearing
         # packages also work with an independently named publishing product.
-        if stem == "META-INF/mivpn-package" or product == "mivpn" or product.startswith("mivpn-") or desktop or android:
-            platforms = tuple(platform for platform, supported in (("desktop", desktop), ("android", android)) if supported)
+        if stem == "META-INF/mivpn-package" or product == "mivpn" or product.startswith("mivpn-") or desktop or android or ios:
+            platforms = tuple(platform for platform, supported in
+                              (("desktop", desktop), ("android", android), ("ios", ios)) if supported)
         return product, platforms
 
 
@@ -334,8 +337,8 @@ class CatalogIndex:
                     if isinstance(value, dict):
                         errors.append(value)
                         continue
-                    if platform is not None and platform not in value.platforms:
-                        continue
+                    # Keep the platform argument for existing callers, but it
+                    # is a client hint only. All platforms share one catalog.
                     existing = chosen.get(value.extension_id)
                     if existing is None or version_parts(value.version) > version_parts(existing.version):
                         chosen[value.extension_id] = value

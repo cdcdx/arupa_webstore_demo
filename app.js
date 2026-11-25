@@ -14,13 +14,18 @@ let packages = [];
 let installed = new Map();
 const prepared = new Map();
 const statusErrors = new Map();
-const platform = /Android/i.test(window.navigator?.userAgent || '') ? 'android' : 'desktop';
+const userAgent = window.navigator?.userAgent || '';
+const platform = /iPad|iPhone|iPod/i.test(userAgent) ||
+  /Macintosh/i.test(userAgent) && (window.navigator?.maxTouchPoints || 0) > 1 ? 'ios' :
+  /Android/i.test(userAgent) ? 'android' : 'desktop';
 
 function show(message) { status.textContent = message; }
 function installErrorMessage(error, item) {
   const original = String(error?.message || 'install_failed');
   const code = original.match(/\(([a-z][a-z0-9_]+)\)\s*$/)?.[1] || original;
   const responseRules = item.requirements?.responseStageRules || 0;
+  if (code === 'signed_extension_restart_required')
+    return '安装未提交：旧版扩展的运行副本仍在当前浏览器进程中。请完全退出并重新启动浏览器，再点击安装。';
   if (code === 'dnr_kernel_capability_unavailable')
     return `安装失败：浏览器内核缺少插件所需的网络规则能力${responseRules ? `；该插件有 ${responseRules} 条默认启用规则需要“响应头匹配”` : ''}。浏览器返回：${code}。`;
   if (code === 'dnr_package_invalid')
@@ -272,6 +277,12 @@ function render() {
     file.className = 'file-name';
     file.textContent = item.file;
     title.append(file);
+    const hint = document.createElement('div');
+    hint.className = 'file-name';
+    const labels = { desktop: '桌面', android: 'Android', ios: 'iOS' };
+    hint.textContent = `平台提示：${Array.isArray(item.platforms) && item.platforms.length
+      ? item.platforms.map(value => labels[value] || value).join(' / ') : '未声明，以浏览器校验为准'}`;
+    title.append(hint);
     row.insertCell().textContent = item.version;
     row.insertCell().textContent = formatBytes(item.size);
     row.insertCell().textContent = !catalogReady ? '状态未确认' : !mode ? '无法读取' : statusErrors.get(item.id) || (!current ? '未安装' : upgrade ? `已安装 ${current.version}，可升级` :

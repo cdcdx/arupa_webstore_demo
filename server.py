@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from crx_catalog import CatalogIndex, Package, valid_extension_id
+from crx_catalog import CatalogIndex, Package, PLATFORMS, valid_extension_id
 from local_tunnel import LocalTunnel
 
 HOST = "0.0.0.0"
@@ -36,6 +36,34 @@ ASSETS = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
+
+
+def byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """Return one inclusive byte range; ignore unsupported/malformed fields.
+
+    Decimal bounds are clamped as strings before conversion so oversized
+    numerals cannot overflow or hit Python's integer conversion limit.
+    """
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", (value or "").strip(), re.IGNORECASE)
+    if not match or not any(match.groups()):
+        return None
+    first, last = ((part.lstrip("0") or "0") if part else "" for part in match.groups())
+    if first and last and (len(last), last) < (len(first), first):
+        return None
+
+    def bounded(number: str) -> int:
+        limit = str(size)
+        return size if (len(number), number) > (len(limit), limit) else int(number)
+
+    if first:
+        start = bounded(first)
+        if start >= size:
+            raise ValueError("range_not_satisfiable")
+        return start, min(bounded(last), size - 1) if last else size - 1
+    suffix = bounded(last)
+    if suffix == 0 or size == 0:
+        raise ValueError("range_not_satisfiable")
+    return size - suffix, size - 1
 
 
 def lan_ip() -> str | None:
@@ -97,24 +125,29 @@ class DemoServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server: DemoServer
 
-    def send_headers(self, code: int, content_type: str, length: int) -> None:
+    def send_headers(self, code: int, content_type: str, length: int,
+                     extra_headers: dict[str, str] | None = None) -> None:
         package = content_type == "application/x-chrome-extension"
         self.send_response(code)
         self.send_header("Content-Type", content_type)
-        if not package or not self.server.package_without_length:
+        if not package or code == 206 or not self.server.package_without_length:
             self.send_header("Content-Length", str(length))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-store, no-transform" if package else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; connect-src 'self'; "
             "style-src 'self'; object-src 'none'; frame-ancestors 'none'",
         )
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
 
-    def send_bytes(self, code: int, body: bytes, content_type: str) -> None:
-        self.send_headers(code, content_type, len(body))
-        self.wfile.write(body)
+    def send_bytes(self, code: int, body: bytes, content_type: str,
+                   extra_headers: dict[str, str] | None = None) -> None:
+        self.send_headers(code, content_type, len(body), extra_headers)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def send_package(self, package: Package) -> None:
         source = None
@@ -146,12 +179,35 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         with source:
-            self.send_headers(200, "application/x-chrome-extension", package.size)
-            interval = max(1, (package.size + 7) // 8)
+            etag = '"' + package.sha256 + '"'
+            headers = {"Accept-Ranges": "bytes", "ETag": etag}
+            selected = None
+            ranges = self.headers.get_all("Range", [])
+            validators = self.headers.get_all("If-Range", [])
+            # Only GET has range semantics. A single matching strong ETag is
+            # accepted; weak, date or ambiguous validators fall back to 200.
+            if (self.command == "GET" and len(ranges) == 1
+                    and (not validators or len(validators) == 1 and validators[0].strip() == etag)):
+                try:
+                    selected = byte_range(ranges[0], package.size)
+                except ValueError:
+                    self.send_bytes(416, b"range_not_satisfiable", "text/plain; charset=utf-8",
+                                    {**headers, "Content-Range": f"bytes */{package.size}"})
+                    return
+            start, end = selected if selected is not None else (0, package.size - 1)
+            length = end - start + 1
+            if selected is not None:
+                headers["Content-Range"] = f"bytes {start}-{end}/{package.size}"
+            source.seek(start)
+            self.send_headers(206 if selected is not None else 200,
+                              "application/x-chrome-extension", length, headers)
+            if self.command == "HEAD":
+                return
+            interval = max(1, (length + 7) // 8)
             chunk_size = min(PACKAGE_CHUNK_BYTES, interval) if self.server.package_delay else PACKAGE_CHUNK_BYTES
             sent, next_pause = 0, 0
             try:
-                while sent < package.size:
+                while sent < length:
                     if self.server.package_delay and sent >= next_pause:
                         if self.server.stopping.wait(self.server.package_delay):
                             self.close_connection = True
@@ -163,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
                     if (current.st_size, current.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                         self.close_connection = True
                         return
-                    chunk = source.read(min(chunk_size, package.size - sent))
+                    chunk = source.read(min(chunk_size, length - sent))
                     if not chunk:
                         self.close_connection = True
                         return
@@ -227,7 +283,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if url.path == "/api/catalog":
             platforms = parse_qs(url.query, keep_blank_values=True).get("platform", ["desktop"])
-            if len(platforms) != 1 or platforms[0] not in ("desktop", "android"):
+            if len(platforms) != 1 or platforms[0] not in PLATFORMS:
                 self.send_bytes(400, b"invalid_platform", "text/plain; charset=utf-8")
                 return
             packages, errors = self.server.catalog.get(platforms[0])
@@ -246,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             platforms = query.get("platform", ["desktop"])
             hashes = query.get("sha256", [])
-            if (len(platforms) != 1 or platforms[0] not in ("desktop", "android")
+            if (len(platforms) != 1 or platforms[0] not in PLATFORMS
                     or hashes and (len(hashes) != 1 or not re.fullmatch(r"[a-f0-9]{64}", hashes[0]))):
                 self.send_bytes(400, b"invalid_package_request", "text/plain; charset=utf-8")
                 return
@@ -262,6 +318,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.send_bytes(404, b"not_found", "text/plain; charset=utf-8")
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
 
     def do_POST(self) -> None:
         if urlsplit(self.path).path != "/_control/stop":
@@ -297,7 +356,7 @@ def parse_args(argv: list[str] | None = None, defaults: dict | None = None) -> a
                         help="取包响应及每块包体的延迟，0–5000 毫秒")
     parser.add_argument("--package-without-length", action="store_true",
                         default=defaults.get("package_without_length", False),
-                        help="CRX 响应省略 Content-Length")
+                        help="CRX 整包响应省略 Content-Length；206 分段响应仍返回分段长度")
     parser.add_argument(
         "--no-tunnel",
         dest="tunnel",

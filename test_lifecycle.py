@@ -1,4 +1,5 @@
 import concurrent.futures
+import hashlib
 import http.client
 import io
 import json
@@ -151,6 +152,166 @@ class StoreLifecycleTests(unittest.TestCase):
                     process.kill(); process.wait(timeout=5)
 
 
+class RangeDownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.path = self.root / "demo.crx"
+        # Structural fixture to exercise transfer boundaries, not native signature verification.
+        memory = io.BytesIO((server.PACKAGES / "nomad-demo-1.0.crx").read_bytes())
+        with zipfile.ZipFile(memory, "a") as archive:
+            archive.writestr("range-fixture.bin", bytes(range(256)) * 1024)
+        self.raw = memory.getvalue()
+        self.path.write_bytes(self.raw)
+        self.httpd = server.DemoServer(("127.0.0.1", 0), self.root)
+        self.item, = self.httpd.catalog.get()[0]
+        self.route = "/api/package?id=" + self.item.extension_id
+        self.etag = '"' + self.item.sha256 + '"'
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.stop_server)
+        patch = mock.patch.object(server.Handler, "log_message")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def stop_server(self):
+        self.httpd.shutdown(); self.httpd.server_close(); self.thread.join()
+
+    def request(self, headers=None, method="GET", route=None):
+        connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=3)
+        try:
+            if isinstance(headers, list):
+                connection.putrequest(method, route or self.route)
+                for name, value in headers:
+                    connection.putheader(name, value)
+                connection.endheaders()
+            else:
+                connection.request(method, route or self.route, headers=headers or {})
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def test_full_download_and_head_advertise_same_strong_validator(self):
+        status, headers, body = self.request()
+        self.assertEqual((status, body), (200, self.raw))
+        self.assertEqual(headers["Accept-Ranges"], "bytes")
+        self.assertEqual(headers["ETag"], self.etag)
+        self.assertEqual(headers["Content-Length"], str(len(self.raw)))
+        self.assertNotIn("Content-Range", headers)
+        self.assertIn("no-transform", headers["Cache-Control"])
+        for extra in ({}, {"Range": "bytes=3-9"}, {"Range": "bytes=999999999-"}):
+            with self.subTest(headers=extra):
+                status, head, body = self.request(extra, method="HEAD")
+                self.assertEqual((status, body), (200, b""))
+                for key in ("Accept-Ranges", "ETag", "Content-Length"):
+                    self.assertEqual(head[key], headers[key])
+                self.assertNotIn("Content-Range", head)
+
+    def test_single_ranges_return_exact_inclusive_slices_and_lengths(self):
+        size = len(self.raw)
+        cases = [("bytes=0-15", 0, 15), ("bytes=65535-65537", 65535, 65537),
+                 (f"bytes={size - 7}-999999999", size - 7, size - 1),
+                 ("bytes=100-", 100, size - 1), ("bytes=-17", size - 17, size - 1),
+                 ("bytes=-999999999", 0, size - 1), ("bytes=0-", 0, size - 1),
+                 ("bytes=0000002-0000004", 2, 4),
+                 ("bytes=3-" + "9" * 5000, 3, size - 1),
+                 ("bytes=-" + "9" * 5000, 0, size - 1)]
+        for field, start, end in cases:
+            with self.subTest(range=field[:50]):
+                status, headers, body = self.request({"Range": field})
+                self.assertEqual(status, 206)
+                self.assertEqual(headers["Content-Range"], f"bytes {start}-{end}/{size}")
+                self.assertEqual(headers["Content-Length"], str(end - start + 1))
+                self.assertEqual(headers["ETag"], self.etag)
+                self.assertEqual(headers["Accept-Ranges"], "bytes")
+                self.assertEqual(body, self.raw[start:end + 1])
+
+    def test_unsatisfiable_ranges_return_416_with_current_full_size(self):
+        size = len(self.raw)
+        for field in (f"bytes={size}-", f"bytes={size + 1}-{size + 10}",
+                      "bytes=-0", "bytes=" + "9" * 5000 + "-"):
+            with self.subTest(range=field[:50]):
+                status, headers, body = self.request({"Range": field})
+                self.assertEqual(status, 416)
+                self.assertEqual(headers["Content-Range"], f"bytes */{size}")
+                self.assertEqual(headers["ETag"], self.etag)
+                self.assertEqual(headers["Content-Length"], str(len(body)))
+                self.assertEqual(body, b"range_not_satisfiable")
+
+    def test_malformed_unknown_and_multiple_ranges_are_ignored(self):
+        for field in ("items=1-2", "bytes=", "bytes=-", "bytes=9-3", "bytes=abc-",
+                      "bytes=0-1,3-4", "bytes= 1-2", "bytes=+1-2", "bytes=1.5-2"):
+            with self.subTest(range=field):
+                status, headers, body = self.request({"Range": field})
+                self.assertEqual((status, body), (200, self.raw))
+                self.assertNotIn("Content-Range", headers)
+        status, headers, body = self.request([("Range", "bytes=0-1"), ("Range", "bytes=3-4")])
+        self.assertEqual((status, body), (200, self.raw))
+        self.assertNotIn("Content-Range", headers)
+
+    def test_if_range_only_resumes_with_one_matching_strong_etag(self):
+        status, headers, body = self.request({"Range": "bytes=123-", "If-Range": self.etag})
+        self.assertEqual((status, body), (206, self.raw[123:]))
+        self.assertEqual(headers["Content-Range"], f"bytes 123-{len(self.raw) - 1}/{len(self.raw)}")
+        for validator in ('"older-package"', "W/" + self.etag, "Wed, 25 Nov 2026 00:00:00 GMT", ""):
+            for field in ("bytes=123-", "bytes=999999999-"):
+                with self.subTest(validator=validator, range=field):
+                    status, headers, body = self.request({"Range": field, "If-Range": validator})
+                    self.assertEqual((status, body), (200, self.raw))
+                    self.assertNotIn("Content-Range", headers)
+        status, _, body = self.request([("Range", "bytes=123-"), ("If-Range", self.etag), ("If-Range", self.etag)])
+        self.assertEqual((status, body), (200, self.raw))
+
+    def test_interrupted_download_resumes_in_both_length_modes_and_hashes_match(self):
+        for without_length in (False, True):
+            with self.subTest(without_length=without_length):
+                self.httpd.package_without_length = without_length
+                self.httpd.package_delay = 0.005
+                connection = http.client.HTTPConnection(*self.httpd.server_address, timeout=3)
+                try:
+                    connection.request("GET", self.route)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.getheader("Content-Length"), None if without_length else str(len(self.raw)))
+                    prefix = response.read(70001)
+                    self.assertEqual(len(prefix), 70001)
+                    etag = response.getheader("ETag")
+                    response.close()
+                finally:
+                    connection.close()
+                status, headers, tail = self.request({"Range": f"bytes={len(prefix)}-", "If-Range": etag})
+                self.assertEqual(status, 206)
+                self.assertEqual(headers["Content-Length"], str(len(self.raw) - len(prefix)))
+                self.assertEqual(headers["Content-Range"], f"bytes {len(prefix)}-{len(self.raw) - 1}/{len(self.raw)}")
+                self.assertEqual(prefix + tail, self.raw)
+                self.assertEqual(hashlib.sha256(prefix + tail).hexdigest(), self.item.sha256)
+
+    def test_range_uses_verified_descriptor_across_atomic_replace(self):
+        replacement = self.root / "replacement.tmp"
+        replacement.write_bytes((server.ROOT / "samples/nomad-demo-1.1.crx").read_bytes())
+        original_send = server.Handler.send_headers
+
+        def replace_before_headers(handler, code, content_type, length, extra_headers=None):
+            if content_type == "application/x-chrome-extension":
+                replacement.replace(self.path)
+            return original_send(handler, code, content_type, length, extra_headers)
+
+        with mock.patch.object(server.Handler, "send_headers", replace_before_headers):
+            status, headers, body = self.request({"Range": "bytes=12-100"})
+        self.assertEqual((status, body), (206, self.raw[12:101]))
+        self.assertEqual(headers["ETag"], self.etag)
+        # A new request sees the new package; it cannot append its bytes to the old partial file.
+        updated = self.path.read_bytes()
+        status, headers, body = self.request({"Range": "bytes=12-", "If-Range": self.etag})
+        self.assertEqual((status, body), (200, updated))
+        self.assertNotEqual(headers["ETag"], self.etag)
+        status, headers, body = self.request({"Range": "bytes=12-"}, route=self.route + "&sha256=" + self.item.sha256)
+        self.assertEqual((status, body), (409, b"package_changed"))
+        self.assertNotIn("Content-Range", headers)
+
+
 class HttpAndCatalogTests(unittest.TestCase):
     def test_http_requests_share_cache_and_invalidate_errors_replacements_and_deletion(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -251,11 +412,20 @@ class HttpAndCatalogTests(unittest.TestCase):
                             self.assertEqual(bytes(received), raw)
                         finally: connection.close()
                     connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
+                    try:
+                        connection.request("GET", "/api/package?id=" + item.extension_id,
+                                           headers={"Range": "bytes=70001-"})
+                        response = connection.getresponse()
+                        self.assertEqual(response.status, 206)
+                        self.assertEqual(response.getheader("Content-Length"), str(len(raw) - 70001))
+                        self.assertEqual(response.read(), raw[70001:])
+                    finally: connection.close()
+                    connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
                     connection.request("GET", "/api/package?id=" + item.extension_id)
                     response = connection.getresponse(); response.read(1); connection.close()
                     wait_until(lambda: all(stream.closed for stream in streams))
-                self.assertEqual(len(streams), 3)
-                self.assertGreaterEqual(sum(position == 0 for position, _ in reads), 6, "same open file is verified then rewound for each transfer")
+                self.assertEqual(len(streams), 4)
+                self.assertGreaterEqual(sum(position == 0 for position, _ in reads), 7, "same open file is verified then positioned for each transfer")
             finally:
                 httpd.shutdown(); httpd.server_close(); thread.join()
 
@@ -336,12 +506,12 @@ class HttpAndCatalogTests(unittest.TestCase):
             httpd = server.DemoServer(("127.0.0.1", 0), root)
             send_headers = server.Handler.send_headers
 
-            def replace_after_verification(handler, code, content_type, length):
+            def replace_after_verification(handler, code, content_type, length, extra_headers=None):
                 if content_type == "application/x-chrome-extension":
                     replacement = root / "replacement.tmp"
                     replacement.write_bytes(b"different file")
                     replacement.replace(package)
-                return send_headers(handler, code, content_type, length)
+                return send_headers(handler, code, content_type, length, extra_headers)
 
             thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             thread.start()

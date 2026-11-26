@@ -304,6 +304,18 @@ def signed_package_metadata(data: bytes, manifest: dict) -> tuple[str | None, tu
         return product, platforms
 
 
+def latest_by_id(packages: list[Package]) -> dict[str, Package]:
+    """Keep legacy ID-only downloads deterministic, including equal versions."""
+    chosen: dict[str, Package] = {}
+    for package in packages:
+        previous = chosen.get(package.extension_id)
+        version = (version_parts(package.version) + (0,) * 4)[:4]
+        old_version = (version_parts(previous.version) + (0,) * 4)[:4] if previous else ()
+        if previous is None or version > old_version or version == old_version and package.path.name < previous.path.name:
+            chosen[package.extension_id] = package
+    return chosen
+
+
 class CatalogIndex:
     """Cache parsed metadata, never package bytes; stat every file on each lookup."""
 
@@ -312,9 +324,9 @@ class CatalogIndex:
         self._entries: dict[Path, tuple[tuple, Package | dict]] = {}
         self._lock = threading.Lock()
 
-    def get(self, platform: str | None = None) -> tuple[list[Package], list[dict]]:
+    def get(self, platform: str | None = None, *, all_packages: bool = False) -> tuple[list[Package], list[dict]]:
         with self._lock:
-            chosen: dict[str, Package] = {}
+            packages = []
             errors = []
             entries = {}
             for path in sorted(self.packages_dir.glob("*.crx")):
@@ -339,13 +351,14 @@ class CatalogIndex:
                         continue
                     # Keep the platform argument for existing callers, but it
                     # is a client hint only. All platforms share one catalog.
-                    existing = chosen.get(value.extension_id)
-                    if existing is None or version_parts(value.version) > version_parts(existing.version):
-                        chosen[value.extension_id] = value
+                    packages.append(value)
                 except OSError as error:
                     errors.append({"file": path.name, "error": str(error)})
             self._entries = entries
-            return sorted(chosen.values(), key=lambda item: (item.name.casefold(), item.extension_id)), errors
+            selected = packages if all_packages else latest_by_id(packages).values()
+            return sorted(selected, key=lambda item: (item.name.casefold(), item.extension_id,
+                          tuple(-n for n in (version_parts(item.version) + (0,) * 4)[:4]),
+                          item.path.name)), errors
 
 
 def catalog(packages_dir: Path, platform: str | None = None) -> tuple[list[Package], list[dict]]:

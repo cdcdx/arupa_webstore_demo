@@ -18,9 +18,9 @@ import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
-from crx_catalog import CatalogIndex, Package, PLATFORMS, valid_extension_id
+from crx_catalog import CatalogIndex, Package, PLATFORMS, latest_by_id, valid_extension_id
 from local_tunnel import LocalTunnel
 
 HOST = "0.0.0.0"
@@ -127,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_headers(self, code: int, content_type: str, length: int,
                      extra_headers: dict[str, str] | None = None) -> None:
-        package = content_type == "application/x-chrome-extension"
+        package = content_type in ("application/x-chrome-extension", "application/octet-stream")
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         if not package or code == 206 or not self.server.package_without_length:
@@ -149,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def send_package(self, package: Package) -> None:
+    def send_package(self, package: Package, *, attachment: bool = False) -> None:
         source = None
         try:
             if package.path.is_symlink():
@@ -198,9 +198,14 @@ class Handler(BaseHTTPRequestHandler):
             length = end - start + 1
             if selected is not None:
                 headers["Content-Range"] = f"bytes {start}-{end}/{package.size}"
+            if attachment:
+                filename = package.path.name
+                fallback = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
+                headers["Content-Disposition"] = (
+                    f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(filename, safe="")}')
             source.seek(start)
             self.send_headers(206 if selected is not None else 200,
-                              "application/x-chrome-extension", length, headers)
+                              "application/octet-stream" if attachment else "application/x-chrome-extension", length, headers)
             if self.command == "HEAD":
                 return
             interval = max(1, (length + 7) // 8)
@@ -282,13 +287,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if url.path == "/api/catalog":
-            platforms = parse_qs(url.query, keep_blank_values=True).get("platform", ["desktop"])
+            query = parse_qs(url.query, keep_blank_values=True)
+            platforms = query.get("platform", ["desktop"])
             if len(platforms) != 1 or platforms[0] not in PLATFORMS:
                 self.send_bytes(400, b"invalid_platform", "text/plain; charset=utf-8")
                 return
-            packages, errors = self.server.catalog.get(platforms[0])
+            all_values = query.get("all", ["0"])
+            if len(all_values) != 1 or all_values[0] not in ("0", "1"):
+                self.send_bytes(400, b"invalid_catalog_request", "text/plain; charset=utf-8")
+                return
+            all_packages = all_values[0] == "1"
+            packages, errors = self.server.catalog.get(platforms[0], all_packages=all_packages)
+            defaults = latest_by_id(packages)
             body = json.dumps(
-                {"packages": [package.public() for package in packages], "errors": errors},
+                {"packages": [package.public() | ({"isLatest": defaults[package.extension_id] is package}
+                              if all_packages else {}) for package in packages], "errors": errors},
                 ensure_ascii=False,
             ).encode()
             self.send_bytes(200, body, "application/json; charset=utf-8")
@@ -302,19 +315,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             platforms = query.get("platform", ["desktop"])
             hashes = query.get("sha256", [])
+            files = query.get("file", [])
+            downloads = query.get("download", ["0"])
             if (len(platforms) != 1 or platforms[0] not in PLATFORMS
-                    or hashes and (len(hashes) != 1 or not re.fullmatch(r"[a-f0-9]{64}", hashes[0]))):
+                    or hashes and (len(hashes) != 1 or not re.fullmatch(r"[a-f0-9]{64}", hashes[0]))
+                    or files and (len(files) != 1 or not files[0] or any(c in files[0] for c in ("/", "\\", "\x00")))
+                    or len(downloads) != 1 or downloads[0] not in ("0", "1")):
                 self.send_bytes(400, b"invalid_package_request", "text/plain; charset=utf-8")
                 return
-            packages, _ = self.server.catalog.get(platforms[0])
-            package = next((item for item in packages if item.extension_id == ids[0]), None)
+            packages, _ = self.server.catalog.get(platforms[0], all_packages=bool(files))
+            package = next((item for item in packages if item.extension_id == ids[0]
+                            and (not files or item.path.name == files[0])), None)
             if package is None:
                 self.send_bytes(404, b"package_not_found", "text/plain; charset=utf-8")
                 return
             if hashes and hashes[0] != package.sha256:
                 self.send_bytes(409, b"package_changed", "text/plain; charset=utf-8")
                 return
-            self.send_package(package)
+            if downloads[0] == "1":
+                self.send_package(package, attachment=True)
+            else:
+                self.send_package(package)
             return
 
         self.send_bytes(404, b"not_found", "text/plain; charset=utf-8")

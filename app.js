@@ -77,6 +77,22 @@ function canUpdate(item) {
 function canUpdateSigned(item) {
   return installMode(item) === 'signed' && typeof window.chrome?.nomadSignedExtensions?.update === 'function';
 }
+function operationError(item) {
+  return statusErrors.get(item.id) || (installed.get(item.id)?.mode &&
+    installed.get(item.id).mode !== installMode(item) ? '该 ID 已通过其他通道安装，请使用对应通道的包或在浏览器扩展管理页处理' : null);
+}
+function catalogFileAllowed(item) {
+  return installMode(item) !== 'catalog' || item.isLatest !== false;
+}
+function packageUrl(item, download = false) {
+  const url = new URL('/api/package', window.location.origin);
+  url.searchParams.set('id', item.id);
+  url.searchParams.set('platform', platform);
+  url.searchParams.set('sha256', item.sha256);
+  if (typeof item.file === 'string') url.searchParams.set('file', item.file);
+  if (download) url.searchParams.set('download', '1');
+  return url;
+}
 function unavailableMessage(item) {
   if (item.signedProduct) return '请使用支持签名网页安装的新版逐风浏览器';
   return '无签名';
@@ -288,14 +304,20 @@ function render() {
     hint.textContent = `平台提示：${Array.isArray(item.platforms) && item.platforms.length
       ? item.platforms.map(value => labels[value] || value).join(' / ') : '未声明，以浏览器校验为准'}`;
     title.append(hint);
+    const identity = document.createElement('div');
+    identity.className = 'file-name';
+    identity.textContent = `ID：${item.id}${item.isLatest ? ' · 默认安装包' : ''}`;
+    title.append(identity);
     row.insertCell().textContent = item.version;
     row.insertCell().textContent = formatBytes(item.size);
-    row.insertCell().textContent = !catalogReady ? '状态未确认' : !mode ? '无法读取' : statusErrors.get(item.id) || (!current ? '未安装' : upgrade ? `已安装 ${current.version}，可升级` :
+    row.insertCell().textContent = !catalogReady ? '状态未确认' : !mode ? '无法读取' : operationError(item) || (!current ? '未安装' : upgrade ? `已安装 ${current.version}，${catalogFileAllowed(item) ? '可升级' : '本包较新，仅供下载'}` :
       `已安装${current.version ? ` ${current.version}` : '（版本未知）'}${current.enabled ? '' : '（已停用）'}`);
     const actions = row.insertCell();
     if (!catalogReady) actions.textContent = '请刷新目录后重试';
-    else if (!mode || statusErrors.has(item.id)) {
-      actions.textContent = statusErrors.has(item.id) ? '请刷新后重试' : unavailableMessage(item);
+    else if (!mode || operationError(item)) {
+      actions.textContent = operationError(item) ? '请在对应通道操作或刷新重试' : unavailableMessage(item);
+    } else if (!catalogFileAllowed(item)) {
+      actions.textContent = '此文件可下载；当前浏览器的目录通道仅支持安装或升级到默认包。';
     } else if (!current) actions.append(button('安装', () => void install(item)));
     else {
       if (upgrade && canUpdate(item)) actions.append(prepared.get(item.id) === item.sha256
@@ -303,9 +325,20 @@ function render() {
         : button('准备升级', () => void checkUpdate(item)));
       if (upgrade && mode === 'signed') {
         if (canUpdateSigned(item)) actions.append(button('升级', () => void updateSigned(item)));
-        else actions.append('发现新版本；当前浏览器尚不支持签名插件原地升级，请使用支持升级接口的新版逐风。');
+        else actions.append('发现新版本；请使用支持升级接口的新版逐风。');
       }
       actions.append(button('卸载', () => void uninstall(item)));
+    }
+    if (typeof item.file === 'string') {
+      const download = document.createElement('a');
+      download.textContent = '下载 CRX';
+      download.href = packageUrl(item, true).href;
+      download.download = item.file;
+      download.className = 'package-download';
+      download.addEventListener('click', () => {
+        if (!busy) show(`已请求下载 ${item.file}，请查看浏览器下载列表；文件保存位置由浏览器决定。`);
+      });
+      actions.append(download);
     }
   }
 }
@@ -317,7 +350,7 @@ async function refresh({ internal = false } = {}) {
   catalogReady = false;
   setBusy(true);
   try {
-    const catalog = await fetchJson(`/api/catalog?platform=${platform}`);
+    const catalog = await fetchJson(`/api/catalog?platform=${platform}&all=1`);
     if (!Array.isArray(catalog.packages) || !Array.isArray(catalog.errors)) throw new Error('目录响应格式无效');
     packages = catalog.packages;
     for (const [id, hash] of prepared) {
@@ -329,25 +362,23 @@ async function refresh({ internal = false } = {}) {
       try {
         const all = await readChrome(chrome.management, 'getAll');
         if (!Array.isArray(all)) throw new Error('安装状态响应格式无效');
-        installed = new Map(all.filter(item => item.type === 'extension').map(item => [item.id, item]));
+        installed = new Map(all.filter(item => item.type === 'extension').map(item => [item.id, { ...item, mode: 'catalog' }]));
       } catch (error) {
         for (const item of packages.filter(item => installMode(item) === 'catalog'))
           statusErrors.set(item.id, `读取安装状态失败：${error.message}`);
       }
     }
-    await Promise.all(packages.filter(item => installMode(item) === 'signed').map(async item => {
+    const signedItems = [...new Map(packages.filter(item => installMode(item) === 'signed').map(item => [item.id, item])).values()];
+    await Promise.all(signedItems.map(async item => {
       try {
         const result = signedStatus(item, await readChrome(chrome.nomadSignedExtensions, 'getStatus', item.id));
-        if (result.state === 'absent' && installed.has(item.id))
-          throw new Error('该 ID 已通过其他通道安装，请在浏览器扩展管理页处理');
-        installed.delete(item.id);
         if (result.state !== 'absent') installed.set(item.id, {
-          version: result.version, product: result.product, enabled: result.state === 'installed',
+          version: result.version, product: result.product, enabled: result.state === 'installed', mode: 'signed',
         });
       } catch (error) { statusErrors.set(item.id, `读取安装状态失败：${error.message}`); }
     }));
     catalogReady = true;
-    const summary = packages.some(item => installMode(item)) ? `已读取 ${packages.length} 个插件。` :
+    const summary = packages.some(item => installMode(item)) ? `已读取 ${packages.length} 个 CRX 文件，共 ${new Set(packages.map(item => item.id)).size} 个扩展 ID。` :
       '请使用新版逐风浏览器。公网地址可安装带逐风发布签名的扩展，普通 CRX 请从本机商店安装。';
     show(catalog.errors?.length ? `有 ${catalog.errors.length} 个 CRX 无效：${catalog.errors.map(e => e.file + ' (' + e.error + ')').join('，')}` :
       statusErrors.size ? `${summary} 有 ${statusErrors.size} 个插件的安装状态读取失败，请刷新重试。` : summary);
@@ -360,7 +391,7 @@ async function refreshAfter(message) {
   show(refreshed ? message : `${message}目录刷新失败，请点击刷新重试。`);
 }
 async function install(item) {
-  if (busy || !catalogReady || !installMode(item) || statusErrors.has(item.id)) return;
+  if (busy || !catalogReady || !installMode(item) || operationError(item) || !catalogFileAllowed(item)) return;
   if (installMode(item) === 'signed') return installSigned(item);
   const fallback = '等待浏览器核验与确认…';
   const progress = trackProgress(item, 'install', fallback);
@@ -383,7 +414,7 @@ async function install(item) {
   finally { progress?.stop(); setBusy(false); }
 }
 async function updateSigned(item) {
-  if (busy || !catalogReady || statusErrors.has(item.id)) return;
+  if (busy || !catalogReady || operationError(item)) return;
   if (!canUpdateSigned(item)) { show('当前浏览器尚不支持签名插件原地升级，请使用支持升级接口的新版逐风。'); return; }
   const current = installed.get(item.id);
   if (!current?.version || !newer(item.version, current.version)) {
@@ -393,16 +424,12 @@ async function updateSigned(item) {
 }
 async function installSigned(item, operation = 'install') {
   const action = operation === 'update' ? '升级' : '安装';
-  const packageUrl = new URL('/api/package', window.location.origin);
-  packageUrl.searchParams.set('id', item.id);
-  packageUrl.searchParams.set('platform', platform);
-  packageUrl.searchParams.set('sha256', item.sha256);
   const fallback = '浏览器正在取包并校验发布签名，请留意权限确认窗口…';
   const progress = trackProgress(item, operation, fallback, window.chrome?.nomadSignedExtensions);
   beginInstallProgress(item, operation, !!progress);
   // Keep the native call inside the original click's user activation.
   const pending = callChrome(chrome.nomadSignedExtensions, operation, {
-    extensionId: item.id, packageUrl: packageUrl.href, expectedSha256: item.sha256,
+    extensionId: item.id, packageUrl: packageUrl(item).href, expectedSha256: item.sha256,
     ...(progress && { operationId: progress.operationId }),
   });
   setBusy(true); show(progress ? '准备取包…' : fallback);
@@ -429,7 +456,7 @@ async function installSigned(item, operation = 'install') {
 }
 async function uninstall(item) {
   const mode = installMode(item);
-  if (busy || !catalogReady || !mode || statusErrors.has(item.id)) return;
+  if (busy || !catalogReady || !mode || operationError(item)) return;
   progressPanel.dataset.result = 'idle';
   showProgressAvailability();
   const pending = mode === 'signed'
@@ -448,7 +475,7 @@ async function uninstall(item) {
   finally { setBusy(false); }
 }
 async function checkUpdate(item) {
-  if (busy || !catalogReady || statusErrors.has(item.id) || !canUpdate(item)) return;
+  if (busy || !catalogReady || operationError(item) || !catalogFileAllowed(item) || !canUpdate(item)) return;
   const fallback = '正在验证本地升级包…';
   const progress = trackProgress(item, 'update_check', fallback);
   beginInstallProgress(item, 'update_check', !!progress);
@@ -467,7 +494,7 @@ async function checkUpdate(item) {
   finally { progress?.stop(); setBusy(false); }
 }
 async function applyUpdate(item) {
-  if (busy || !catalogReady || statusErrors.has(item.id) || !canUpdate(item)) return;
+  if (busy || !catalogReady || operationError(item) || !catalogFileAllowed(item) || !canUpdate(item)) return;
   beginInstallProgress(item, 'install', false, true);
   const pending = callChrome(chrome.webstorePrivate, 'applyUpdate', item.id);
   setBusy(true); show('正在升级，若权限变化请在浏览器中确认…');

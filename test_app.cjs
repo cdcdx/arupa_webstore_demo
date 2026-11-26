@@ -153,7 +153,7 @@ function signedBrowser(options = {}) {
   const oldUpdateBrowser = signedBrowser({ initialStatus: previous });
   const oldUpdatePage = await page(oldUpdateBrowser.chrome, [signed]);
   assert.equal(oldUpdatePage.buttons(0).map(b => b.textContent).join(','), '卸载');
-  assert.ok(oldUpdatePage.actions(0).children.some(text => typeof text === 'string' && /尚不支持签名插件原地升级/.test(text)));
+  assert.ok(oldUpdatePage.actions(0).children.some(text => typeof text === 'string' && /发现新版本.*支持升级接口/.test(text)));
   await oldUpdatePage.context.updateSigned(signed);
   assert.match(oldUpdatePage.status(), /尚不支持签名插件原地升级/);
   assert.equal(oldUpdateBrowser.calls.filter(([method]) => ['install', 'uninstall', 'update'].includes(method)).length, 0);
@@ -278,6 +278,116 @@ function signedBrowser(options = {}) {
     }
   }
 
+  // Each physical file is a separate row; installed status stays keyed by ID.
+  const historical = { ...signed, version: '0.9', sha256: '2'.repeat(64), file: '旧版 0.9.crx', isLatest: false };
+  const latest = { ...signed, file: 'latest.crx', isLatest: true };
+  let installedVersion = null;
+  const fileCalls = [];
+  const multiBrowser = { runtime: {}, nomadSignedExtensions: {
+    getStatus(id, cb) {
+      fileCalls.push(['status', id]);
+      cb(installedVersion ? { extensionId: id, state: 'installed', product: signed.signedProduct, version: installedVersion }
+        : { extensionId: id, state: 'absent' });
+    },
+    install(details, cb) {
+      fileCalls.push(['install', details]);
+      const selected = new URL(details.packageUrl).searchParams.get('file') === historical.file ? historical : latest;
+      installedVersion = selected.version;
+      cb({ extensionId: signed.id, product: signed.signedProduct, version: installedVersion });
+    },
+    update(details, cb) {
+      fileCalls.push(['update', details]); installedVersion = latest.version;
+      cb({ extensionId: signed.id, product: signed.signedProduct, version: installedVersion });
+    },
+    uninstall(id, cb) { fileCalls.push(['uninstall', id]); installedVersion = null; cb(); },
+  } };
+  const multi = await page(multiBrowser, [latest, historical]);
+  assert.equal(multi.nodes['#packages'].children.length, 2);
+  assert.equal(fileCalls.filter(([method]) => method === 'status').length, 1, 'same ID is queried once, not once per file');
+  assert.equal(multi.buttons(0)[0].textContent, '安装');
+  assert.equal(multi.buttons(1)[0].textContent, '安装');
+  const oldDownload = multi.actions(1).children.find(node => node.tag === 'a');
+  assert.equal(new URL(oldDownload.href).searchParams.get('file'), historical.file);
+  assert.equal(new URL(oldDownload.href).searchParams.get('sha256'), historical.sha256);
+  assert.equal(oldDownload.download, historical.file);
+  assert.match(multi.status(), /2 个 CRX 文件，共 1 个扩展 ID/);
+  assert.equal(new URL(oldDownload.href).searchParams.get('download'), '1');
+  oldDownload.click();
+  assert.match(multi.status(), /已请求下载.*旧版 0.9.crx.*浏览器下载列表/);
+  assert.equal(multi.nodes['#install-progress'].dataset.result, 'idle', 'file download must not become an installation');
+  multi.context.setBusy(true);
+  const downloadMessage = multi.status();
+  oldDownload.click();
+  assert.equal(multi.status(), downloadMessage, 'manual downloads do not overwrite an active installation message');
+  multi.context.setBusy(false);
+  await multi.context.install(historical);
+  const selectedCall = fileCalls.find(([method]) => method === 'install')[1];
+  assert.equal(new URL(selectedCall.packageUrl).searchParams.get('file'), historical.file);
+  assert.equal(selectedCall.expectedSha256, historical.sha256);
+  assert.equal(new URL(selectedCall.packageUrl).searchParams.get('download'), null, 'native installs retain the CRX package response');
+  assert.equal(multi.status(), '安装成功。');
+  assert.equal(multi.buttons(0)[0].textContent, '升级');
+  assert.equal(multi.buttons(1)[0].textContent, '卸载');
+  await multi.context.updateSigned(latest);
+  assert.equal(new URL(fileCalls.find(([method]) => method === 'update')[1].packageUrl).searchParams.get('file'), latest.file);
+  assert.equal(multi.buttons(0)[0].textContent, '卸载');
+  assert.equal(multi.buttons(1)[0].textContent, '卸载', 'old row must not offer a downgrade');
+  await multi.context.uninstall(historical);
+  assert.equal(multi.buttons(0)[0].textContent, '安装');
+  assert.equal(multi.buttons(1)[0].textContent, '安装', 'uninstall affects the shared extension ID');
+
+  const legacyFileCalls = [];
+  const catalogOld = { ...ordinary, file: 'old.crx', version: '0.9', isLatest: false };
+  const catalogNew = { ...ordinary, file: 'new.crx', isLatest: true };
+  const fileLegacy = { runtime: {}, management: { getAll: cb => cb([]) }, webstorePrivate: {
+    beginInstallWithManifest3(details, cb) { legacyFileCalls.push(['begin', details]); cb(''); },
+    completeInstall(id, cb) { legacyFileCalls.push(['complete', id]); cb(); },
+    checkUpdate(id, cb) { legacyFileCalls.push(['check', id]); cb(); },
+    applyUpdate(id, cb) { legacyFileCalls.push(['apply', id]); cb(); },
+  } };
+  const legacyFiles = await page(fileLegacy, [catalogNew, catalogOld]);
+  assert.equal(legacyFiles.buttons(0)[0].textContent, '安装');
+  assert.equal(legacyFiles.buttons(1).length, 0);
+  assert.match(legacyFiles.actions(1).textContent, /仅支持安装或升级到默认包/);
+  assert.equal(new URL(legacyFiles.actions(1).children.find(node => node.tag === 'a').href).searchParams.get('file'), catalogOld.file);
+  await legacyFiles.context.install(catalogOld);
+  await legacyFiles.context.checkUpdate(catalogOld);
+  await legacyFiles.context.applyUpdate(catalogOld);
+  assert.equal(legacyFileCalls.length, 0, 'ID-only catalog APIs cannot select a historical file');
+  await legacyFiles.context.install(catalogNew);
+  assert.equal(legacyFileCalls[0][0], 'begin');
+  fileLegacy.management.getAll = cb => cb([{ id: ordinary.id, type: 'extension', version: '0.8', enabled: true }]);
+  await legacyFiles.context.refresh();
+  assert.match(legacyFiles.nodes['#packages'].children[1].children[3].textContent, /本包较新，仅供下载/);
+  assert.equal(legacyFiles.buttons(1).length, 0);
+
+  // Same-ID catalog and signed files must not operate on another channel's installation.
+  const mixedSigned = { ...latest, isLatest: false };
+  const mixedOrdinary = { ...catalogNew, id: signed.id };
+  const mixedApi = signedBrowser();
+  mixedApi.chrome.management = { getAll: cb => cb([{ id: signed.id, type: 'extension', version: '0.8', enabled: true }]) };
+  mixedApi.chrome.webstorePrivate = { ...fileLegacy.webstorePrivate };
+  const mixed = await page(mixedApi.chrome, [mixedOrdinary, mixedSigned]);
+  assert.equal(mixed.buttons(0)[0].textContent, '准备升级');
+  assert.equal(mixed.buttons(1).length, 0);
+  assert.match(mixed.nodes['#packages'].children[1].children[3].textContent, /其他通道安装/);
+  await mixed.context.install(mixedSigned);
+  await mixed.context.updateSigned(mixedSigned);
+  await mixed.context.uninstall(mixedSigned);
+  assert.equal(mixedApi.calls.filter(([method]) => ['install', 'update', 'uninstall'].includes(method)).length, 0);
+  const signedOwnerApi = signedBrowser({ initialStatus: { extensionId: signed.id, state: 'installed', version: '0.8' }, supportUpdate: true });
+  signedOwnerApi.chrome.management = mixedApi.chrome.management;
+  signedOwnerApi.chrome.webstorePrivate = mixedApi.chrome.webstorePrivate;
+  const signedOwner = await page(signedOwnerApi.chrome, [mixedOrdinary, mixedSigned]);
+  assert.equal(signedOwner.buttons(0).length, 0);
+  assert.equal(signedOwner.buttons(1)[0].textContent, '升级');
+  const before = legacyFileCalls.length;
+  await signedOwner.context.install(mixedOrdinary);
+  await signedOwner.context.checkUpdate(mixedOrdinary);
+  await signedOwner.context.applyUpdate(mixedOrdinary);
+  await signedOwner.context.uninstall(mixedOrdinary);
+  assert.equal(legacyFileCalls.length, before);
+
   // Signed progress uses its own namespace and leaves the final callback in
   // charge of success. Control timers so the tests exercise the in-flight path.
   for (const outcome of ['success', 'cancel', 'query-error', 'lan-http']) {
@@ -390,7 +500,7 @@ function signedBrowser(options = {}) {
 
   const mobileBrowser = signedBrowser();
   const mobile = await page(mobileBrowser.chrome, [signed], 'Mozilla/5.0 Android');
-  assert.equal(mobile.requests[0], '/api/catalog?platform=android');
+  assert.equal(mobile.requests[0], '/api/catalog?platform=android&all=1');
   await mobile.context.install(signed);
   assert.equal(new URL(mobileBrowser.calls.find(call => call[0] === 'install')[1].packageUrl).searchParams.get('platform'), 'android');
 
@@ -399,7 +509,7 @@ function signedBrowser(options = {}) {
     ['Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)', 5]]) {
     const fixture = signedBrowser();
     const iosPage = await page(fixture.chrome, [iosItem], agent, touches);
-    assert.equal(iosPage.requests[0], '/api/catalog?platform=ios');
+    assert.equal(iosPage.requests[0], '/api/catalog?platform=ios&all=1');
     assert.equal(iosPage.buttons(0)[0].textContent, '安装');
     assert.equal(iosPage.nodes['#packages'].children[0].children[0].children[1].textContent, '平台提示：iOS');
     await iosPage.context.install(iosItem);

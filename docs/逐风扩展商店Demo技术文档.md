@@ -92,14 +92,16 @@ flowchart TD
 | --- | --- | --- |
 | `GET /` | 商店页面 | 静态 `index.html` |
 | `GET /docs` | 网页接口说明 | 静态 `api.html`；不等于开放整个 docs 目录 |
-| `GET /api/catalog?platform=desktop` | 统一目录 | `{packages: [], errors: []}`；platform 可为 desktop、android、ios，默认 desktop；仅作提示，不过滤 |
-| `GET /api/package?id=...&platform=desktop&sha256=...` | 下载 CRX3 | ID 必须为 32 个 a 至 p 字符；platform、sha256 可省略；摘要为 64 位小写十六进制 |
+| `GET /api/catalog?platform=desktop&all=1` | 逐文件目录 | `{packages: [], errors: []}`；all=1 返回每个 CRX，附 isLatest 默认包标记；省略 all 仍每 ID 一个最高版本；platform 仅作提示 |
+| `GET /api/package?id=...&file=...&platform=desktop&sha256=...` | 下载 CRX3 | ID 必填；file 可选，用目录文件名精确取包；省略 file 仍选默认包；platform、sha256 可省略；摘要为 64 位小写十六进制 |
 | `HEAD /api/package?id=...` | 获取整包头信息 | 参数校验同 GET；忽略 Range；无包体 |
 | `GET /api/health` | 存活与服务识别 | `{status: 'ok', service: 'arupa-webstore-demo'}` |
 | `GET /api/runtime` | 当前访问地址和隧道状态 | `instanceId/localUrl/lanUrl/tunnel`；不返回控制 token |
 | `POST /_control/stop` | 启停脚本停止服务 | 需要回环 Host、控制 token，且不能带 Origin 或 Sec-Fetch-Site；不是网页业务 API |
 
-CRX 下载返回 `application/x-chrome-extension`，整包为 `200`，有效单段范围为 `206`。包接口的 HTTP 400 表示参数无效，404 表示当前目录没有对应 ID，409 表示指定摘要不符或读包时内容变化，416 表示合法范围无法满足。浏览器下载器还会再次验证包的完整性、签名和身份，HTTP 成功不表示可安装。
+CRX 下载返回 `application/x-chrome-extension`，整包为 `200`，有效单段范围为 `206`。包接口的 HTTP 400 表示参数无效，404 表示当前目录没有对应 ID/文件组合，409 表示指定摘要不符或读包时内容变化，416 表示合法范围无法满足。file 禁止路径分隔符、NUL、空值及重复值，且只能选择目录索引中的真实文件，不能访问目录外路径。选中文件删除或变化时明确失败，不回退其他版本。浏览器仍验证包的完整性、签名和身份。
+
+网页“下载 CRX”另加 download=1，成功响应改为 application/octet-stream 并附 Content-Disposition: attachment、ASCII 回退文件名和 UTF-8 filename*；正文仍为所选原始 CRX，摘要及续传语义不变。错误响应不附附件名。原生安装/升级 URL 不带该参数，继续使用 CRX MIME。点击提示只是已请求浏览器下载；真实进度、保存位置和完成状态由浏览器管理，不能把 HTTP 200 或网页提示当作文件落盘。
 
 所有响应使用 `Cache-Control: no-store` 和 `nosniff`，CRX 额外使用 `no-transform`。页面 CSP 允许同源脚本、样式和连接，禁止 object 与嵌入。静态页面、health 和 runtime 当前不接受 query，不能给 `/` 或 `/app.js` 任意追加版本参数作为刷新办法。[HTTP 实现][demo-http]。
 
@@ -146,11 +148,11 @@ CRX 下载返回 `application/x-chrome-extension`，整包为 `200`，有效单�
 
 `signedProduct` 来自 `META-INF/nomad-package.json/.sig` 或兼容的 `mivpn-package.json/.sig`。目录只读取元数据和签名文件长度，检查 schema、产品名格式、版本及 ID，**不验证 Ed25519 签名**。它只是前端路由提示。
 
-目录和取包均不再按 platform 过滤；desktop、android、ios 是兼容保留的客户端提示，三种请求返回同一份目录。当前页面识别 iPhone、iPad、iPod 及触控模式的 iPadOS 桌面 UA，并传 ios 提示；展示和安装入口不据平台标签隐藏。
+目录和取包均不按 platform 过滤；三种提示返回相同内容。网页以 all=1 展示每个 CRX 文件，同 ID 多版本及同版本的多个文件均独立成行。getStatus 按 ID 去重查询，各行共用已安装状态；卸载移除该 ID 的当前版本。当前页面识别 iPhone、iPad、iPod 及触控模式的 iPadOS 桌面 UA，并传 ios 提示。
 
 MiVPN 保留实际引擎与产品元数据推导的提示：桌面识别已知桌面引擎路径，Android 识别 DEX/原生库，mivpn-ios 标记 iOS，即使包内只有 nodes.json 也可展示。通用包默认三个平台提示。标签不是原生安装能力判定，当前浏览器仍须提供对应 API 并完成验证。
 
-同版本同 ID 有多个文件时，保留按文件名排序先遇到的文件。平台标签属于路由提示，不能代替浏览器的真实兼容性检查。
+为兼容宿主，省略 all 的旧目录接口仍按同 ID 最高数字版本选默认包，版本补零后等价时按文件名排序选第一个；all=1 的 isLatest 标记这个默认包。签名安装/升级和逐文件下载均传 id/file/sha256，准确锁定所选文件。普通目录宿主只按 ID 取默认包，因此非默认文件只提供下载，避免使用错误 manifest 发起安装。不同安装通道的同 ID 不允许交叉管理；平台标签不代替浏览器的真实兼容性检查。
 
 每个 DemoServer 持有独立的 CatalogIndex，目录和取包请求跨请求、跨平台复用解析结果。索引每次扫描文件名与 lstat 信息，按设备、inode、类型、大小和纳秒时间戳失效；解析期间文件变化会报告 package_changed，下一次请求再解析。缓存不保存包体，无效包也缓存至文件状态变化。首次解析仍将 CRX 整包读入内存。
 
@@ -171,6 +173,7 @@ const operationId = typeof api.getOperationProgress === 'function'
   ? createOperationId() : null; // 使用 Demo 已有的 UUID helper
 const packageUrl = new URL('/api/package', location.origin);
 packageUrl.searchParams.set('id', item.id);
+packageUrl.searchParams.set('file', item.file);
 packageUrl.searchParams.set('platform', 'desktop');
 packageUrl.searchParams.set('sha256', item.sha256);
 
@@ -431,7 +434,7 @@ getter 不存在时使用配套新浏览器；存在但返回 signed_extension_h
 | 检查 | 结果与范围 |
 | --- | --- |
 | `node test_app.cjs` | 通过；覆盖签名及目录新装、进度关联、未知大小、100% 非安装完成、取消、查询失败、回执、状态可选字段、局域网 UUID、checkUpdate 准备与 applyUpdate 应用边界；新增签名升级模拟桥合同与旧版能力回退验证，未验证真实原生升级 |
-| `python3 -m unittest -q` | 38 项通过；覆盖目录缓存、流式读取、iOS 展示、平台提示、摘要锁定，以及单段范围、416、HEAD、If-Range、超大数字、中断续传、未知长度与原子替换 |
+| `python3 -m unittest -q` | 隔离副本中 42 项通过；恢复跟踪样例仅作测试夹具，未改动用户移走的线上文件。覆盖目录缓存、流式读取、精确选包、范围续传、附件响应、错误响应、UTF-8 文件名及响应头注入检查 |
 | `node --check app.js` | 通过 |
 | `bash -n start.sh start.command` | 通过；不替代 Windows 批处理实机运行 |
 | 真实 HTTP 与网页进度回归 | 已知及未知 Content-Length 各下载 MiVPN 桌面包 37,163,347 字节，摘要一致；每轮记录 17 份阶段快照，页面完成下载、校验、等待确认、安装及原成功回调展示。浏览器安装接口为模拟桥接，未写入扩展 |
@@ -440,6 +443,10 @@ getter 不存在时使用配套新浏览器；存在但返回 signed_extension_h
 上述网页回归使用 start.sh 启停隔离实例，证据保存在 [HTTP 与安装进度回归记录](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/stream-install-progress.json)。原生界面连接超时，真实原生安装闭环本轮未重复；不能把模拟桥接的成功状态当作真实插件安装。
 
 断点续传证据见 [range-resume.json](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/range-resume.json)，HTTP 复现代码保存在同一忽略目录的 [range-resume.py](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/range-resume.py)。该检查验证传输和摘要，未调用原生安装；正式回归入口仍为 unittest 与 start.*，没有新增用户命令入口。
+
+2026-11-26 逐文件目录回归：本机和公网均读取到 AI 搜片 0.2.4/0.2.7 与示例 1.0/1.1 四个文件、两个 ID；默认目录仍为两个最新版。四个文件逐一下载并核对摘要及范围响应，证据见 [multi-file-catalog.json](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/multi-file-catalog.json)。真实目录数据经过模拟 DOM 渲染，确认四行及各自精确下载链接，见 [multi-file-dom.json](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/multi-file-dom.json)；该验证没有调用原生安装。
+
+2026-11-26 手动下载回归：隔离 Chrome 用真实点击触发下载，记录 Browser.downloadWillBegin 和 completed，再从磁盘读取文件核对大小与 SHA-256。本机与公网记录分别见 [manual-download-after/result.json](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/manual-download-after/result.json) 和 [manual-download-public/result.json](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/manual-download-public/result.json)。这是标准 Chrome 的真实落盘验证，不代表逐风 Mac GUI 已验收；用户所报逐风点击无反应仍需配套实机确认。测试下载仅保存在忽略的 .runtime/qa 下。
 
 Arupa 的[签名安装进度验收报告][progress-report]记录 Mac 安装与能力测试 46 项通过，Windows/Linux 签名安装测试各 18 项通过，并记录 Mac arm64 隔离 Release/Prod 第二版浏览器通过 HTTPS 完成两次 MiVPN 安装，观察到真实下载字节及权限等待、安装、完成阶段，随后完成网页卸载。该报告明确未重复 Windows/Linux GUI 闭环与本轮重启加载；这些范围不应写成三端全部实机验收完成。本轮修复验证 Demo HTTP 行为和安装接口交互，未重新执行浏览器原生安装。
 
@@ -460,11 +467,11 @@ Arupa 的[签名安装进度验收报告][progress-report]记录 Mac 安装与�
 
 [demo-app]: /Users/flex/workplace/arupa_webstore_demo/app.js:1
 [demo-mode]: /Users/flex/workplace/arupa_webstore_demo/app.js:69
-[demo-signed]: /Users/flex/workplace/arupa_webstore_demo/app.js:394
-[demo-progress]: /Users/flex/workplace/arupa_webstore_demo/app.js:212
-[demo-refresh]: /Users/flex/workplace/arupa_webstore_demo/app.js:314
+[demo-signed]: /Users/flex/workplace/arupa_webstore_demo/app.js:425
+[demo-progress]: /Users/flex/workplace/arupa_webstore_demo/app.js:228
+[demo-refresh]: /Users/flex/workplace/arupa_webstore_demo/app.js:347
 [demo-http]: /Users/flex/workplace/arupa_webstore_demo/server.py:152
-[demo-catalog]: /Users/flex/workplace/arupa_webstore_demo/crx_catalog.py:245
+[demo-catalog]: /Users/flex/workplace/arupa_webstore_demo/crx_catalog.py:319
 [demo-lifecycle]: /Users/flex/workplace/arupa_webstore_demo/storectl.py:132
 [demo-tunnel]: /Users/flex/workplace/arupa_webstore_demo/local_tunnel.py:65
 [signed-schema]: /Users/flex/workplace/chromium/arupa_desktop/plugin/api/nomad_signed_extensions.json:1

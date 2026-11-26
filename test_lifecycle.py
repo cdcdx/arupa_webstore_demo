@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import zipfile
+from urllib.parse import unquote
 from unittest import mock
 
 import crx_catalog
@@ -208,6 +209,54 @@ class RangeDownloadTests(unittest.TestCase):
                 for key in ("Accept-Ranges", "ETag", "Content-Length"):
                     self.assertEqual(head[key], headers[key])
                 self.assertNotIn("Content-Range", head)
+
+    def test_manual_download_is_an_attachment_and_preserves_range_and_raw_install(self):
+        route = self.route + "&download=1"
+        for without_length in (False, True):
+            with self.subTest(without_length=without_length):
+                self.httpd.package_without_length = without_length
+                status, headers, body = self.request(route=route)
+                self.assertEqual((status, body), (200, self.raw))
+                self.assertEqual(headers["Content-Type"], "application/octet-stream")
+                self.assertEqual(headers["Content-Disposition"], 'attachment; filename="demo.crx"; filename*=UTF-8\'\'demo.crx')
+                self.assertEqual(headers["ETag"], self.etag)
+                self.assertEqual(headers.get("Content-Length"), None if without_length else str(len(self.raw)))
+                status, headers, body = self.request({"Range": "bytes=3-19", "If-Range": self.etag}, route=route)
+                self.assertEqual((status, body), (206, self.raw[3:20]))
+                self.assertEqual(headers["Content-Length"], "17")
+                self.assertEqual(headers["Content-Range"], f"bytes 3-19/{len(self.raw)}")
+                self.assertIn("attachment", headers["Content-Disposition"])
+                status, headers, body = self.request(route=route, method="HEAD")
+                self.assertEqual((status, body), (200, b""))
+                self.assertIn("attachment", headers["Content-Disposition"])
+                status, headers, body = self.request({"Range": "bytes=999999999-"}, route=route)
+                self.assertEqual(status, 416)
+                self.assertNotIn("Content-Disposition", headers, "never save an error response as a CRX")
+        for suffix in ("", "&download=0"):
+            status, headers, body = self.request(route=self.route + suffix)
+            self.assertEqual((status, body), (200, self.raw))
+            self.assertEqual(headers["Content-Type"], "application/x-chrome-extension")
+            self.assertNotIn("Content-Disposition", headers)
+        for suffix in ("&download=2", "&download=", "&download=1&download=0"):
+            status, headers, body = self.request(route=self.route + suffix)
+            self.assertEqual(status, 400)
+            self.assertNotIn("Content-Disposition", headers)
+        status, headers, body = self.request(route=route + "&sha256=" + "0" * 64)
+        self.assertEqual(status, 409)
+        self.assertNotIn("Content-Disposition", headers)
+
+    def test_attachment_filename_is_utf8_and_cannot_inject_headers(self):
+        for filename in ('扩展 "测试".crx', '扩展\r\nX-Injected: yes.crx'):
+            with self.subTest(filename=filename):
+                new_path = self.root / filename
+                self.path.replace(new_path); self.path = new_path
+                status, headers, body = self.request(route=self.route + "&download=1")
+                self.assertEqual((status, body), (200, self.raw))
+                disposition = headers["Content-Disposition"]
+                self.assertEqual(unquote(disposition.split("filename*=UTF-8''")[1]), filename)
+                self.assertTrue(disposition.isascii())
+                self.assertNotIn("\r", disposition); self.assertNotIn("\n", disposition)
+                self.assertNotIn("X-Injected", headers)
 
     def test_single_ranges_return_exact_inclusive_slices_and_lengths(self):
         size = len(self.raw)

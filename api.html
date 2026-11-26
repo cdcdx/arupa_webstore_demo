@@ -39,8 +39,8 @@
 
 <section id="http-api" aria-labelledby="http-api-heading"><h2 id="http-api-heading">网站 HTTP 接口</h2>
 <p>以下接口只读，不执行安装。无效请求返回 HTTP 状态和 <code>text/plain</code> 错误码；成功的目录、存活和运行状态返回 JSON。</p><div class="table-wrap"><table><thead><tr><th scope="col">方法与路径</th><th scope="col">参数</th><th scope="col">响应</th></tr></thead><tbody>
-<tr><td><code>GET /api/catalog</code></td><td>platform 可选，desktop / android / ios，默认 desktop；仅作客户端提示，不过滤目录；重复或空值非法</td><td>200：<code>{packages: Package[], errors: CatalogError[]}</code>；400：invalid_platform</td></tr>
-<tr><td><code>GET /api/package</code></td><td>id 必填，32 位 a–p；platform 可选，desktop / android / ios，默认 desktop；不限制取包；sha256 可选，64 位小写十六进制；支持单段 Range 与强 ETag If-Range</td><td>200：整包；206：分段 CRX；400：invalid_extension_id / invalid_package_request；404：package_not_found；409：package_changed；416：range_not_satisfiable</td></tr>
+<tr><td><code>GET /api/catalog</code></td><td>platform 可选，desktop / android / ios，默认 desktop；仅作客户端提示；all 可选 0 / 1，默认 0；各参数重复或空值非法</td><td>200：<code>{packages: Package[], errors: CatalogError[]}</code>；all=1 返回所有有效文件，否则每 ID 一个默认包；400：invalid_platform / invalid_catalog_request</td></tr>
+<tr><td><code>GET /api/package</code></td><td>id 必填；platform、file、sha256 可选；file 为目录文件名，经 URLSearchParams 编码且禁止路径分隔符；download 可选 0 / 1，默认 0；支持单段 Range 与强 ETag If-Range</td><td>200：整包；206：分段 CRX；download=1 为附件保存；400：invalid_extension_id / invalid_package_request；404：package_not_found；409：package_changed；416：range_not_satisfiable</td></tr>
 <tr><td><code>HEAD /api/package</code></td><td>查询参数同 GET；忽略 Range</td><td>200：整包头信息、Accept-Ranges 和 ETag，无包体；参数及摘要错误同 GET</td></tr>
 <tr><td><code>GET /api/health</code></td><td>无参数</td><td>200：<code>{status: "ok", service: "arupa-webstore-demo"}</code></td></tr>
 <tr><td><code>GET /api/runtime</code></td><td>无参数</td><td>200：service、instanceId、localUrl、lanUrl、tunnel</td></tr>
@@ -49,11 +49,12 @@
 <tr><td>id / name / version</td><td>string</td><td>扩展安装 ID、已解析显示名称、Chromium 数字版本</td></tr>
 <tr><td>manifest</td><td>object</td><td>包内 MV3 清单；目录通道按此预览与实际包比较</td></tr>
 <tr><td>sha256 / size / file</td><td>string / number / string</td><td>完整 CRX 的 SHA-256、字节数、原文件名；size ≤ 128 MiB</td></tr>
+<tr><td>isLatest</td><td>boolean，可选</td><td>仅 all=1 时返回；true 表示 ID-only 下载选中的默认包。同版本等价时以文件名排序第一个为默认，其他文件仍独立展示</td></tr>
 <tr><td>signedProduct</td><td>string 或 null</td><td>发布清单元数据提示，不是已验签结论</td></tr>
-<tr><td>platforms</td><td>string[]</td><td>兼容性提示，可含 desktop / android / ios；不限制展示或安装入口，同 ID 仍选全局最高版本</td></tr>
+<tr><td>platforms</td><td>string[]</td><td>兼容性提示，可含 desktop / android / ios；不限制展示，不参与默认包选择</td></tr>
 <tr><td>requirements</td><td>object</td><td>可含 responseStageRules；缺失不证明无相关规则，存在也不等于兼容性判定</td></tr>
 <tr><td>errors[]</td><td><code>{file: string, error: string}[]</code></td><td>无效 CRX 的文件名和原因；其他有效包继续返回</td></tr>
-</tbody></table></div><p>桌面、Android、iOS 包统一展示，所有有效 platform 提示返回相同目录。MiVPN 保留引擎和产品元数据推导的平台标签；mivpn-ios 标记 iOS，不要求包内携带桌面或 Android 引擎。通用扩展默认三个平台提示，标签不代表已完成原生兼容性验收。只扫描 packages 第一层 *.crx；服务级缓存、同 ID 最高版本选择和 SHA-256 锁定继续有效。当前浏览器是否提供安装接口及能否通过原生验证，决定实际安装结果。</p><pre><code id="example-http" data-language="shell">curl &#x27;http://127.0.0.1:18731/api/catalog?platform=desktop&#x27;
+</tbody></table></div><p>桌面、Android、iOS 包统一展示，所有有效 platform 提示返回相同目录。MiVPN 保留引擎和产品元数据推导的平台标签；mivpn-ios 标记 iOS，不要求包内携带桌面或 Android 引擎。通用扩展默认三个平台提示，标签不代表已完成原生兼容性验收。只扫描 packages 第一层 *.crx，复用服务级元数据缓存。</p><p>商店使用 all=1，让每个 CRX 文件独立一行，状态和卸载仍按扩展 ID 共享。签名通道与每行“下载 CRX”使用 id + file + sha256：file 必须来自目录，不能把它直接拼进 URL 路径。指定文件不存在或不属于该 ID 返回 404，摘要变化返回 409，绝不回退其他文件。省略 file 时仍按默认最高版本选包，sha256 只锁定该默认包。普通目录通道只按 ID 取包，因此仅默认包提供安装/升级操作，其他行保留下载。不同通道安装的同 ID 不能互相接管。</p><pre><code id="example-http" data-language="shell">curl &#x27;http://127.0.0.1:18731/api/catalog?platform=desktop&amp;all=1&#x27;
 # 将 ID 和摘要替换为上一条目录响应的值；不直接用 file 字段拼路径。
 curl -f &#x27;http://127.0.0.1:18731/api/package?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;platform=desktop&amp;sha256=目录返回的摘要&#x27; -o extension.crx</code></pre><h3>取包与断点续传</h3><p>包响应类型为 <code>application/x-chrome-extension</code>。服务先以不超过 64 KiB 的读取校验整个文件的摘要，再定位同一打开文件并分块发送所需字节。原子替换不会切换已打开的下载；发送前检测到变化返回 409，发送中发现原地改写或截断会中止连接。不要把部分包体当作下载完成。</p>
 <div class="table-wrap"><table><thead><tr><th scope="col">请求或响应头</th><th scope="col">当前行为</th></tr></thead><tbody>
@@ -76,6 +77,9 @@ ETag: "原响应的64位SHA256"
 Content-Range: bytes 262144-1048575/1048576
 Content-Length: 786432</code></pre>
 <p>上述为 1 MiB 文件的协议示意；实际 ETag、起点与完整大小应取原下载响应和本地文件。单段范围与校验器语义参见 <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-range">RFC 9110</a>。</p>
+<h3>网页“下载 CRX”与安装取包</h3>
+<p>手动下载链接在 id、file、sha256 之外附加 <code>download=1</code>。200/206 及成功 HEAD 返回 <code>application/octet-stream</code> 和 <code>Content-Disposition: attachment</code>；filename 为安全 ASCII 回退名，filename* 为百分号编码的 UTF-8 原文件名，参见 <a href="https://www.rfc-editor.org/rfc/rfc6266.html#section-4.3">RFC 6266</a>。下载内容、ETag、摘要验证和范围续传不变，400/404/409/416 错误不附附件文件名。download 为空、重复或不为 0/1 返回 400。</p>
+<p>正常点击后应由浏览器新增下载任务，保存 CRX 文件；网页显示“已请求下载”，不表示文件已保存完成。保存位置、下载进度和取消由浏览器下载界面管理，安装阶段条不追踪手动下载。浏览器若未接好原生下载处理，仅服务端返回 200 仍不能证明文件落盘。安装及升级传给原生 API 的 packageUrl 不带 download=1，继续返回 application/x-chrome-extension，不因手动下载入口改变。</p>
 <h3>网络约束</h3><p>响应使用 no-store、nosniff 和同源 CSP；CRX 额外使用 no-transform。Host/端口及跨站子资源请求受限制，403 返回 forbidden；未开放跨域 CORS。页面、health、runtime 和静态资源不接受 query 参数。整包 CRX 可省略 Content-Length，因此下载必须支持未知总大小。</p><h3>运行地址结构</h3><pre><code id="example-runtime" data-language="json">{
   &quot;service&quot;: &quot;arupa-webstore-demo&quot;,
   &quot;instanceId&quot;: &quot;服务实例标识&quot;,
@@ -118,6 +122,7 @@ if (typeof api?.update !== 'function') {
 }
 const url = new URL('/api/package', location.origin);
 url.searchParams.set('id', item.id);
+url.searchParams.set('file', item.file);
 url.searchParams.set('sha256', item.sha256);
 api.update({ extensionId: item.id, packageUrl: url.href,
   expectedSha256: item.sha256 }, result =&gt; {
@@ -298,6 +303,7 @@ function validateSignedStatus(item, status) {
   const operationId = typeof api.getOperationProgress === &#x27;function&#x27; ? newOperationId() : null;
   const url = new URL(&#x27;/api/package&#x27;, window.location.origin);
   url.searchParams.set(&#x27;id&#x27;, item.id);
+  url.searchParams.set(&#x27;file&#x27;, item.file);
   url.searchParams.set(&#x27;platform&#x27;, currentClientPlatform());
   url.searchParams.set(&#x27;sha256&#x27;, item.sha256);
 

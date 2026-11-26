@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+from urllib.parse import urlencode
+from unittest import mock
 import shutil
 import struct
 import subprocess
@@ -249,6 +251,83 @@ class LocalCrxCatalogTests(unittest.TestCase):
             self.assertEqual(len(packages), 1)
             self.assertEqual(packages[0].version, "1.1")
             self.assertEqual(errors[0]["file"], "broken.crx")
+
+    def test_all_files_catalog_and_explicit_file_download_preserve_id_only_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = (server.PACKAGES / "nomad-demo-1.0.crx").read_bytes()
+            new = (server.ROOT / "samples/nomad-demo-1.1.crx").read_bytes()
+            # Same ID, different versions, and identical bytes in a second file.
+            data = {"旧版 1.0.crx": old, "a-new.crx": new, "b-duplicate.crx": new}
+            for name, raw in data.items():
+                (root / name).write_bytes(raw)
+            identity = crx_catalog.crx_id(old)
+            httpd = server.DemoServer(("127.0.0.1", 0), root)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+
+            def request(route, headers=None, method="GET"):
+                connection = http.client.HTTPConnection(*httpd.server_address, timeout=3)
+                try:
+                    connection.request(method, route, headers=headers or {})
+                    response = connection.getresponse()
+                    return response.status, dict(response.getheaders()), response.read()
+                finally:
+                    connection.close()
+
+            try:
+                with mock.patch.object(crx_catalog, "read_package", wraps=crx_catalog.read_package) as reader:
+                    for platform in ("desktop", "android", "ios"):
+                        code, _, payload = request("/api/catalog?all=1&platform=" + platform)
+                        self.assertEqual(code, 200)
+                        items = json.loads(payload)["packages"]
+                        self.assertEqual(len(items), 3)
+                        self.assertEqual({p["id"] for p in items}, {identity})
+                        self.assertEqual([p["file"] for p in items], ["a-new.crx", "b-duplicate.crx", "旧版 1.0.crx"])
+                        self.assertEqual([p["isLatest"] for p in items], [True, False, False])
+                    code, _, payload = request("/api/catalog")
+                    item, = json.loads(payload)["packages"]
+                    self.assertEqual(item["file"], "a-new.crx")
+                    self.assertNotIn("isLatest", item)
+                    self.assertEqual(request("/api/package?id=" + identity)[2], new)
+                    for item in items:
+                        route = "/api/package?" + urlencode({"id": identity, "file": item["file"], "sha256": item["sha256"]})
+                        code, headers, body = request(route)
+                        self.assertEqual((code, body), (200, data[item["file"]]))
+                        self.assertEqual(headers["ETag"], '"' + item["sha256"] + '"')
+                        code, headers, body = request(route, {"Range": "bytes=11-29"})
+                        self.assertEqual((code, body), (206, data[item["file"]][11:30]))
+                        self.assertEqual(headers["Content-Range"], f'bytes 11-29/{item["size"]}')
+                        code, head, body = request(route, method="HEAD")
+                        self.assertEqual((code, body), (200, b""))
+                        self.assertEqual(head["ETag"], headers["ETag"])
+                    self.assertEqual(reader.call_count, 3, "all/default catalogs and selected downloads share the metadata cache")
+                old_item = next(p for p in items if p["version"] == "1.0")
+                self.assertEqual(request(f'/api/package?id={identity}&sha256={old_item["sha256"]}')[0], 409,
+                                 "legacy SHA pins the ID-only default, not another historical file")
+                for selector in ({"file": "missing.crx"}, {"file": "a-new.crx", "id": "a" * 32}):
+                    self.assertEqual(request("/api/package?" + urlencode({"id": identity, **selector}))[0], 404)
+                for filename in ("../a-new.crx", "sub/a-new.crx", "sub\\a-new.crx", "\x00.crx", ""):
+                    self.assertEqual(request("/api/package?" + urlencode({"id": identity, "file": filename}))[0], 400)
+                self.assertEqual(request(f'/api/package?id={identity}&file=a-new.crx&file=b-duplicate.crx')[0], 400)
+                self.assertEqual(request(f'/api/package?id={identity}&file=a-new.crx&sha256={old_item["sha256"]}')[0], 409)
+                for query in ("all=2", "all=", "all=1&all=0"):
+                    self.assertEqual(request("/api/catalog?" + query)[0], 400)
+                route = "/api/package?" + urlencode({"id": identity, "file": old_item["file"], "sha256": old_item["sha256"]})
+                replacement = root / "replace.tmp"; replacement.write_bytes(new); replacement.replace(root / old_item["file"])
+                self.assertEqual(request(route)[0], 409, "replacing a selected file must not return bytes with the old digest")
+                (root / old_item["file"]).unlink()
+                self.assertEqual(request(route)[0], 404, "deleting one selected version must not silently select another")
+                self.assertEqual(len(json.loads(request("/api/catalog?all=1")[2])["packages"]), 2)
+            finally:
+                httpd.shutdown(); httpd.server_close(); thread.join()
+
+    def test_equivalent_version_default_is_deterministic_by_filename(self):
+        from dataclasses import replace
+        item = crx_catalog.read_package(server.PACKAGES / "nomad-demo-1.0.crx")
+        shorter = replace(item, path=Path("a.crx"), version="1.0")
+        longer = replace(item, path=Path("b.crx"), version="1.0.0")
+        for items in ([shorter, longer], [longer, shorter]):
+            self.assertEqual(crx_catalog.latest_by_id(items)[item.extension_id], shorter)
 
     def test_versions(self):
         self.assertEqual(crx_catalog.version_parts("1.2"), (1, 2))

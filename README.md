@@ -93,7 +93,9 @@ python3 server.py --open --browser /path/to/arupa-browser
 
 例如 AI 搜片独立安装页还适配了 `window.nomad.installation` 的 `onProgress` / `list` 任务协议；它与 `chrome.nomadSignedExtensions` 是不同的接口。该协议在目标浏览器中的可用性和任务字段须单独确认，本 Demo 尚未接入。
 
-签名通道目前也没有 `checkUpdate` 接口。已安装签名扩展出现新版时，页面提示手动卸载后重装，不自动卸载。
+签名插件的升级入口已在商店侧接入：目录版本高于已安装版本，且浏览器实际提供 `chrome.nomadSignedExtensions.update(details, callback)` 时显示“升级”。参数沿用 install 的 extensionId、同源 packageUrl、expectedSha256 和可选 operationId，进度通过原 getter 查询，但 operation 必须为 `update`。成功回调仍须返回完整的 extensionId/product/version，网页核对后再刷新状态；失败和取消保留原回调，不自动卸载或降级调用 install。已安装版本未知、同版本或浏览器版本更高时不提供升级操作。
+
+**交付边界（2026-11-26）：本轮仅完成商店接入。当前核对的桌面宿主和内核尚未提供 update 方法，仍需浏览器团队实现并打包交付。** 缺少方法的浏览器显示“当前浏览器尚不支持签名插件原地升级”；仅刷新商店不能增加浏览器能力。宿主需实现有回滚的同 ID 升级、版本/签名/权限校验及数据保留，内核需开放 schema、校验与转发，详见 `/docs` 中的待实现合同。网页测试使用模拟桥验证此合同，不代表原生升级已经完成。
 
 目录和下载不再按平台过滤，支持 `platform=desktop|android|ios`（默认 desktop）作为客户端提示；不同提示返回同一份目录，并按同 ID 最高版本选包。`platforms` 仅表示元数据/引擎推导的兼容性提示，iOS-only 包也会在桌面和 Android 页面展示并保留可用的安装入口。实际安装由当前浏览器的签名、权限和兼容性校验决定。
 

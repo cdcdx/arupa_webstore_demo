@@ -58,6 +58,16 @@ function signedBrowser(options = {}) {
     },
     uninstall(id, cb) { calls.push(['uninstall', id]); current = { extensionId: id, state: 'absent' }; cb(); },
   } };
+  if (options.supportUpdate) chrome.nomadSignedExtensions.update = (details, cb) => {
+    calls.push(['update', details]);
+    if (options.updateError) {
+      chrome.runtime.lastError = { message: options.updateError };
+      cb(); delete chrome.runtime.lastError; return;
+    }
+    current = { extensionId: signed.id, state: current.state === 'disabled' ? 'disabled' : 'installed',
+      product: signed.signedProduct, version: signed.version };
+    cb({ ...current, ...options.updateReceipt });
+  };
   return { chrome, calls };
 }
 
@@ -136,6 +146,137 @@ function signedBrowser(options = {}) {
   assert.equal(optional.buttons(0)[0].textContent, '卸载');
   await optional.context.uninstall(signed);
   assert.equal(optional.status(), '卸载成功。');
+
+  // Signed upgrades require the separate optional API, never uninstall/reinstall
+  // or the catalog update APIs. These are bridge-contract tests, not native installs.
+  const previous = { extensionId: signed.id, state: 'installed', product: signed.signedProduct, version: '0.9' };
+  const oldUpdateBrowser = signedBrowser({ initialStatus: previous });
+  const oldUpdatePage = await page(oldUpdateBrowser.chrome, [signed]);
+  assert.equal(oldUpdatePage.buttons(0).map(b => b.textContent).join(','), '卸载');
+  assert.ok(oldUpdatePage.actions(0).children.some(text => typeof text === 'string' && /尚不支持签名插件原地升级/.test(text)));
+  await oldUpdatePage.context.updateSigned(signed);
+  assert.match(oldUpdatePage.status(), /尚不支持签名插件原地升级/);
+  assert.equal(oldUpdateBrowser.calls.filter(([method]) => ['install', 'uninstall', 'update'].includes(method)).length, 0);
+
+  for (const state of ['installed', 'disabled']) {
+    const fixture = signedBrowser({ supportUpdate: true, initialStatus: { ...previous, state } });
+    fixture.chrome.webstorePrivate = { checkUpdate() { throw new Error('wrong update namespace'); },
+      applyUpdate() { throw new Error('wrong update namespace'); } };
+    const upgraded = await page(fixture.chrome, [signed]);
+    assert.equal(upgraded.buttons(0).map(b => b.textContent).join(','), '升级,卸载');
+    const pending = upgraded.context.updateSigned(signed);
+    const call = fixture.calls.find(([method]) => method === 'update');
+    assert.ok(call, 'update is called synchronously in the original click activation');
+    assert.equal(call[1].extensionId, signed.id);
+    assert.equal(call[1].expectedSha256, signed.sha256);
+    assert.equal(new URL(call[1].packageUrl).searchParams.get('sha256'), signed.sha256);
+    assert.equal(call[1].operationId, undefined, 'optional progress is not required for upgrading');
+    await pending;
+    assert.equal(upgraded.status(), '升级成功。');
+    assert.equal(upgraded.nodes['#install-progress'].dataset.result, 'success');
+    assert.match(upgraded.nodes['#progress-heading'].textContent, /升级进度/);
+    assert.equal(upgraded.buttons(0).map(b => b.textContent).join(','), '卸载');
+    if (state === 'disabled') assert.match(upgraded.nodes['#packages'].children[0].children[3].textContent, /已停用/);
+    assert.equal(fixture.calls.filter(([method]) => ['install', 'uninstall'].includes(method)).length, 0);
+  }
+  for (const version of ['1.0', '1.1', null]) {
+    const fixture = signedBrowser({ supportUpdate: true, initialStatus: { ...previous, version } });
+    const noUpdate = await page(fixture.chrome, [signed]);
+    assert.equal(noUpdate.buttons(0).map(b => b.textContent).join(','), '卸载');
+    await noUpdate.context.updateSigned(signed);
+    assert.equal(fixture.calls.filter(([method]) => method === 'update').length, 0, 'same, newer or unknown installed versions must not trigger an update');
+  }
+  for (const error of ['signed_extension_confirmation_cancelled', 'signed_extension_signature_invalid', 'signed_extension_update_stale']) {
+    const fixture = signedBrowser({ supportUpdate: true, initialStatus: previous, updateError: error });
+    const failedUpdate = await page(fixture.chrome, [signed]);
+    await failedUpdate.context.updateSigned(signed);
+    assert.match(failedUpdate.status(), new RegExp('升级失败：' + error));
+    assert.equal(failedUpdate.nodes['#install-progress'].dataset.result, error.includes('cancelled') ? 'cancelled' : 'failed');
+    assert.equal(failedUpdate.buttons(0)[0].textContent, '升级');
+    assert.equal(failedUpdate.buttons(0)[0].disabled, false);
+    assert.equal(fixture.calls.filter(([method]) => method === 'uninstall').length, 0);
+  }
+  for (const updateReceipt of [{ extensionId: ordinary.id }, { product: 'other-product' }, { version: '0.9' }]) {
+    const fixture = signedBrowser({ supportUpdate: true, initialStatus: previous, updateReceipt });
+    const wrongReceipt = await page(fixture.chrome, [signed]);
+    await wrongReceipt.context.updateSigned(signed);
+    assert.match(wrongReceipt.status(), /升级回执与所选插件不一致/);
+    assert.equal(wrongReceipt.nodes['#install-progress'].dataset.result, 'failed');
+  }
+  const updateUnconfirmed = await page(signedBrowser({ supportUpdate: true, initialStatus: previous,
+    postStatus: { version: '0.9' } }).chrome, [signed]);
+  await updateUnconfirmed.context.updateSigned(signed);
+  assert.match(updateUnconfirmed.status(), /浏览器已完成升级，但升级状态未确认/);
+  assert.equal(updateUnconfirmed.nodes['#install-progress'].dataset.result, 'unconfirmed');
+
+  // Progress 100% and completed remain provisional until the update callback.
+  for (const outcome of ['success', 'cancel', 'query-error']) {
+    const fixture = signedBrowser({ supportUpdate: true, initialStatus: previous });
+    const nativeUpdate = fixture.chrome.nomadSignedExtensions.update;
+    let finish, snapshot;
+    fixture.chrome.nomadSignedExtensions.update = (details, callback) => {
+      fixture.calls.push(['pending-update', details]);
+      snapshot = { operationId: details.operationId, extensionId: signed.id, operation: 'update',
+        stage: 'downloading', receivedBytes: 40, totalBytes: 100 };
+      finish = () => {
+        if (outcome === 'cancel') {
+          fixture.chrome.runtime.lastError = { message: 'signed_extension_confirmation_cancelled' };
+          callback(); delete fixture.chrome.runtime.lastError;
+        } else nativeUpdate(details, callback);
+      };
+    };
+    fixture.chrome.nomadSignedExtensions.getOperationProgress = (id, callback) => {
+      if (outcome === 'query-error') {
+        fixture.chrome.runtime.lastError = { message: 'progress_unavailable' };
+        callback(); delete fixture.chrome.runtime.lastError;
+      } else callback({ progress: snapshot });
+    };
+    const upgradePage = await page(fixture.chrome, [signed]);
+    let uuid = 0, sequence = 0;
+    const timers = new Map();
+    upgradePage.context.window.crypto = { randomUUID: () => `eeeeeeee-eeee-4eee-8eee-${String(++uuid).padStart(12, '0')}` };
+    upgradePage.context.setTimeout = fn => { timers.set(++sequence, fn); return sequence; };
+    upgradePage.context.clearTimeout = id => timers.delete(id);
+    async function tick() {
+      const [id, fn] = timers.entries().next().value;
+      timers.delete(id); await fn();
+    }
+    const pending = upgradePage.context.updateSigned(signed);
+    const firstId = snapshot.operationId;
+    assert.ok(firstId);
+    await upgradePage.context.updateSigned(signed);
+    assert.equal(fixture.calls.filter(([method]) => method === 'pending-update').length, 1, 'busy update rejects repeated clicks');
+    await tick();
+    if (outcome === 'query-error') {
+      assert.match(upgradePage.nodes['#progress-note'].textContent, /progress_unavailable.*升级仍在继续/);
+    } else {
+      assert.match(upgradePage.status(), /40%/);
+      for (const wrong of [{ operationId: 'another' }, { extensionId: ordinary.id }, { operation: 'install' }]) {
+        const actual = snapshot;
+        snapshot = { ...snapshot, stage: 'installing', ...wrong }; await tick();
+        assert.equal(upgradePage.nodes['#install-progress'].dataset.stage, 'downloading');
+        snapshot = actual;
+      }
+      snapshot = { ...snapshot, receivedBytes: 60 }; delete snapshot.totalBytes;
+      await tick(); assert.match(upgradePage.status(), /已接收 60 B/);
+      snapshot = { ...snapshot, receivedBytes: 100, totalBytes: 100 };
+      await tick(); assert.match(upgradePage.status(), /100%/);
+      for (const stage of ['verifying', 'awaiting_user_confirmation', 'installing', 'committing', 'rolling_back', 'completed']) {
+        snapshot = { ...snapshot, stage }; await tick();
+        assert.equal(upgradePage.nodes['#install-progress'].dataset.stage, stage);
+        assert.equal(upgradePage.nodes['#install-progress'].dataset.result, 'pending');
+        assert.doesNotMatch(upgradePage.status(), /升级成功/);
+      }
+    }
+    finish(); await pending;
+    assert.equal(timers.size, 0);
+    assert.match(upgradePage.status(), outcome === 'cancel' ? /升级失败.*cancelled/ : /升级成功/);
+    if (outcome === 'cancel') {
+      const retry = upgradePage.context.updateSigned(signed);
+      assert.notEqual(snapshot.operationId, firstId, 'retry creates a fresh operation ID');
+      finish(); await retry;
+    }
+  }
 
   // Signed progress uses its own namespace and leaves the final callback in
   // charge of success. Control timers so the tests exercise the in-flight path.
@@ -424,5 +565,5 @@ function signedBrowser(options = {}) {
   runtime.lanUrl = 'javascript:alert(1)';
   await context.loadRuntime();
   assert.deepEqual(addresses(), [runtime.localUrl]);
-  console.log('PASS: signed and catalog installation, scoped byte progress, update preparation/application, fallback, cancellation and receipts');
+  console.log('PASS: signed installation and optional upgrade bridge contract, catalog updates, scoped byte progress, fallback, cancellation and receipts');
 })().catch(error => { console.error(error); process.exitCode = 1; });

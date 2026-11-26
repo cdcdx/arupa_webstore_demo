@@ -20,17 +20,17 @@ const platform = /iPad|iPhone|iPod/i.test(userAgent) ||
   /Android/i.test(userAgent) ? 'android' : 'desktop';
 
 function show(message) { status.textContent = message; }
-function installErrorMessage(error, item) {
+function installErrorMessage(error, item, action = '安装') {
   const original = String(error?.message || 'install_failed');
   const code = original.match(/\(([a-z][a-z0-9_]+)\)\s*$/)?.[1] || original;
   const responseRules = item.requirements?.responseStageRules || 0;
   if (code === 'signed_extension_restart_required')
-    return '安装未提交：旧版扩展的运行副本仍在当前浏览器进程中。请完全退出并重新启动浏览器，再点击安装。';
+    return `${action}未提交：旧版扩展的运行副本仍在当前浏览器进程中。请完全退出并重新启动浏览器，再点击${action}。`;
   if (code === 'dnr_kernel_capability_unavailable')
-    return `安装失败：浏览器内核缺少插件所需的网络规则能力${responseRules ? `；该插件有 ${responseRules} 条默认启用规则需要“响应头匹配”` : ''}。浏览器返回：${code}。`;
+    return `${action}失败：浏览器内核缺少插件所需的网络规则能力${responseRules ? `；该插件有 ${responseRules} 条默认启用规则需要“响应头匹配”` : ''}。浏览器返回：${code}。`;
   if (code === 'dnr_package_invalid')
-    return `安装失败：浏览器未通过网络规则校验，具体原因尚未确认${responseRules ? `；该插件有 ${responseRules} 条默认启用规则需要“响应头匹配”，但不能仅凭此断定失败原因` : ''}；请查看浏览器诊断记录。 (${code})`;
-  return `安装失败：${original}`;
+    return `${action}失败：浏览器未通过网络规则校验，具体原因尚未确认${responseRules ? `；该插件有 ${responseRules} 条默认启用规则需要“响应头匹配”，但不能仅凭此断定失败原因` : ''}；请查看浏览器诊断记录。 (${code})`;
+  return `${action}失败：${original}`;
 }
 function apiReady() {
   return ['beginInstallWithManifest3', 'completeInstall'].every(name =>
@@ -73,6 +73,9 @@ function installMode(item) {
 function canUpdate(item) {
   return installMode(item) === 'catalog' && ['checkUpdate', 'applyUpdate'].every(name =>
     typeof window.chrome?.webstorePrivate?.[name] === 'function');
+}
+function canUpdateSigned(item) {
+  return installMode(item) === 'signed' && typeof window.chrome?.nomadSignedExtensions?.update === 'function';
 }
 function unavailableMessage(item) {
   if (item.signedProduct) return '请使用支持签名网页安装的新版逐风浏览器';
@@ -162,6 +165,7 @@ function renderSteps(completed, active = -1, state = 'active') {
   }
 }
 function setInstallStage(stage) {
+  const action = currentOperation === 'update' ? '升级' : '安装';
   const step = { preparing: 0, downloading: 0, verifying: 1, preflight: 1,
     opening_confirmation: 2, awaiting_user_confirmation: 2, installing: 2,
     committing: 2, rolling_back: 2, completed: 2 }[stage];
@@ -171,34 +175,35 @@ function setInstallStage(stage) {
     ['failed', 'cancelled'].includes(stage) ? stage : 'active');
   progressNote.textContent = stage === 'downloading' ? '下载完成后将继续校验扩展包，并请求安装权限。' :
     ['opening_confirmation', 'awaiting_user_confirmation'].includes(stage) ? '等待浏览器权限确认；确认后开始安装。' :
-    stage === 'completed' ? '正在等待并核对浏览器最终安装结果。' :
-    stage === 'unknown' ? '当前无法查询中间进度，请留意权限窗口并等待安装结果。' : '请保持此页面打开，浏览器正在处理安装。';
+    stage === 'completed' ? `正在等待并核对浏览器最终${action}结果。` :
+    stage === 'unknown' ? `当前无法查询中间进度，请留意权限窗口并等待${action}结果。` : `请保持此页面打开，浏览器正在处理${action}。`;
 }
 function beginInstallProgress(item, operation, tracked, ready = false) {
   currentStep = ready ? 2 : -1;
   currentOperation = operation;
   progressPanel.hidden = false;
   progressPanel.dataset.result = 'pending';
-  progressHeading.textContent = `${item.name} · ${operation === 'update_check' ? '升级包准备进度' : '安装进度'}`;
+  progressHeading.textContent = `${item.name} · ${operation === 'update_check' ? '升级包准备进度' : operation === 'update' ? '升级进度' : '安装进度'}`;
   downloadProgress.hidden = true;
   setInstallStage(ready ? 'installing' : tracked ? 'preparing' : 'unknown');
-  if (!tracked && !ready) progressNote.textContent = '当前浏览器未提供分阶段进度，请留意权限窗口并等待安装结果。';
+  if (!tracked && !ready) progressNote.textContent = `当前浏览器未提供分阶段进度，请留意权限窗口并等待${operation === 'update' ? '升级' : '安装'}结果。`;
   progressPanel.scrollIntoView({ block: 'center', behavior: 'auto' });
 }
 function finishInstallProgress(result) {
+  const action = currentOperation === 'update' ? '升级' : '安装';
   progressPanel.dataset.result = result;
   downloadProgress.hidden = true;
   if (['success', 'unconfirmed'].includes(result)) {
     renderSteps(3);
     progressPanel.dataset.stage = 'completed';
-    progressNote.textContent = result === 'success' ? '安装完成，浏览器已确认安装结果。' : '浏览器已完成安装，安装状态待刷新确认。';
+    progressNote.textContent = result === 'success' ? `${action}完成，浏览器已确认${action}结果。` : `浏览器已完成${action}，${action}状态待刷新确认。`;
   } else if (result === 'ready') {
     renderSteps(2);
     progressNote.textContent = '升级包已准备好，点击“升级”后开始安装。';
   } else {
     renderSteps(Math.max(0, currentStep), currentStep, result);
     progressPanel.dataset.stage = result;
-    progressNote.textContent = `${currentOperation === 'update_check' ? '升级包准备' : '安装'}${result === 'cancelled' ? '已取消' : '未完成'}，具体结果见下方提示。`;
+    progressNote.textContent = `${currentOperation === 'update_check' ? '升级包准备' : action}${result === 'cancelled' ? '已取消' : '未完成'}，具体结果见下方提示。`;
   }
 }
 function finishInstallError(error) {
@@ -244,7 +249,7 @@ function trackProgress(item, operation, fallback, api = window.chrome?.webstoreP
     } catch (error) {
       if (active) {
         stop(); currentStep = -1; setInstallStage('unknown'); show(fallback);
-        progressNote.textContent = `进度查询不可用：${error.message}。安装仍在继续，请留意浏览器权限窗口。`;
+        progressNote.textContent = `进度查询不可用：${error.message}。${operation === 'update' ? '升级' : '安装'}仍在继续，请留意浏览器权限窗口。`;
       }
     }
   }
@@ -296,7 +301,10 @@ function render() {
       if (upgrade && canUpdate(item)) actions.append(prepared.get(item.id) === item.sha256
         ? button('升级', () => void applyUpdate(item))
         : button('准备升级', () => void checkUpdate(item)));
-      if (upgrade && mode === 'signed') actions.append('新版需卸载后重新安装。');
+      if (upgrade && mode === 'signed') {
+        if (canUpdateSigned(item)) actions.append(button('升级', () => void updateSigned(item)));
+        else actions.append('发现新版本；当前浏览器尚不支持签名插件原地升级，请使用支持升级接口的新版逐风。');
+      }
       actions.append(button('卸载', () => void uninstall(item)));
     }
   }
@@ -374,16 +382,26 @@ async function install(item) {
   } catch (error) { finishInstallError(error); show(installErrorMessage(error, item)); }
   finally { progress?.stop(); setBusy(false); }
 }
-async function installSigned(item) {
+async function updateSigned(item) {
+  if (busy || !catalogReady || statusErrors.has(item.id)) return;
+  if (!canUpdateSigned(item)) { show('当前浏览器尚不支持签名插件原地升级，请使用支持升级接口的新版逐风。'); return; }
+  const current = installed.get(item.id);
+  if (!current?.version || !newer(item.version, current.version)) {
+    show('尚未确认可升级版本，请刷新插件列表后重试。'); return;
+  }
+  return installSigned(item, 'update');
+}
+async function installSigned(item, operation = 'install') {
+  const action = operation === 'update' ? '升级' : '安装';
   const packageUrl = new URL('/api/package', window.location.origin);
   packageUrl.searchParams.set('id', item.id);
   packageUrl.searchParams.set('platform', platform);
   packageUrl.searchParams.set('sha256', item.sha256);
   const fallback = '浏览器正在取包并校验发布签名，请留意权限确认窗口…';
-  const progress = trackProgress(item, 'install', fallback, window.chrome?.nomadSignedExtensions);
-  beginInstallProgress(item, 'install', !!progress);
+  const progress = trackProgress(item, operation, fallback, window.chrome?.nomadSignedExtensions);
+  beginInstallProgress(item, operation, !!progress);
   // Keep the native call inside the original click's user activation.
-  const pending = callChrome(chrome.nomadSignedExtensions, 'install', {
+  const pending = callChrome(chrome.nomadSignedExtensions, operation, {
     extensionId: item.id, packageUrl: packageUrl.href, expectedSha256: item.sha256,
     ...(progress && { operationId: progress.operationId }),
   });
@@ -393,19 +411,19 @@ async function installSigned(item) {
     const result = await pending;
     progress?.stop();
     if (result?.extensionId !== item.id || result.product !== item.signedProduct || result.version !== item.version)
-      throw new Error('安装回执与所选插件不一致');
+      throw new Error(`${action}回执与所选插件不一致`);
     installedReceipt = true;
     const current = signedStatus(item, await readChrome(chrome.nomadSignedExtensions, 'getStatus', item.id));
     if (!['installed', 'disabled'].includes(current.state) ||
         current.product !== null && current.product !== item.signedProduct ||
         current.version !== null && current.version !== item.version)
-      throw new Error('安装状态尚未确认，请刷新重试');
+      throw new Error(`${action}状态尚未确认，请刷新重试`);
     finishInstallProgress('success');
-    await refreshAfter('安装成功。');
+    await refreshAfter(`${action}成功。`);
   } catch (error) {
     if (installedReceipt) finishInstallProgress('unconfirmed');
     else finishInstallError(error);
-    show(installedReceipt ? `浏览器已完成安装，但安装状态未确认：${error.message}。请刷新重试。` : installErrorMessage(error, item));
+    show(installedReceipt ? `浏览器已完成${action}，但${action}状态未确认：${error.message}。请刷新重试。` : installErrorMessage(error, item, action));
   }
   finally { progress?.stop(); setBusy(false); }
 }

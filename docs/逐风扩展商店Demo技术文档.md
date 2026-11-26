@@ -255,7 +255,7 @@ Google 和 Edge 商店由同一服务适配，但不属于 Demo 的选包后端�
 {
   progress: {
     operationId: '本次操作的非零 UUID',
-    operation: 'install',       // 目录更新检查还可为 update_check
+    operation: 'install',       // 目录更新检查为 update_check；待实现签名升级为 update
     extensionId: '32位扩展ID',
     stage: 'downloading',
     receivedBytes: 524288,
@@ -287,12 +287,12 @@ Google 和 Edge 商店由同一服务适配，但不属于 Demo 的选包后端�
 
 | 项目 | 签名通道 | 目录通道 |
 | --- | --- | --- |
-| 关联对象 | install | beginInstallWithManifest3 或 checkUpdate |
+| 关联对象 | install；商店已接 update，待浏览器提供 | beginInstallWithManifest3 或 checkUpdate |
 | 回调之后能否再查询 | 终态最多保留两分钟，按需清理 | using 作用域结束即删除，不保留终态 |
 | 容量 | 最多 128 条；满时先驱逐旧终态 | 仅记录活动调用 |
 | 缺失或不属于当前文档 | 返回 `{}` | 返回 `{}` |
 | 刷新页面 | 新 document 不能读取旧任务 | 新 document 不能读取旧任务 |
-| 成功失败取消的权威来源 | 原 install 回调 | 原 begin/complete/checkUpdate/applyUpdate 回调 |
+| 成功失败取消的权威来源 | 原 install / update 回调；update 待浏览器提供 | 原 begin/complete/checkUpdate/applyUpdate 回调 |
 
 Demo 在调用安装后启动轮询，每次回包后等待 300 毫秒再查询。只有 downloading 计算 `floor(receivedBytes / totalBytes * 100)`，上限为 100；无总大小时使用不定进度条和已接收大小。校验与安装不分配模拟百分比。快速下载和短暂阶段可能被轮询跳过。
 
@@ -321,7 +321,18 @@ Demo 在调用安装后启动轮询，每次回包后等待 300 毫秒再查询�
 5. 另一次用户点击调用 applyUpdate。新增权限会再次确认，预检指纹与已安装快照再次核对；扩展页面或其他运行时占用可能使应用延期。
 6. 激活并提交成功返回 true；网页刷新状态。失败、取消、延期或过期不能当成已升级。applyUpdate 当前没有接入上述 operationId 轮询。
 
-签名通道当前不提供网页更新 API。Demo 对签名插件的新版本仅提示卸载后重装，不自动卸载。不能因为包来自相同服务器，就把签名安装记录放进目录更新队列。[更新服务][update-service]。
+### 9.1 签名通道升级接入（2026-11-26，仅商店）
+
+本轮商店已接入可选的 `chrome.nomadSignedExtensions.update(details, callback)`，**当前核对的桌面宿主与内核尚未实现此方法**。新接口为待浏览器团队配套的合同，本轮没有修改两个仓库。不能把网页模拟桥测试或函数存在的检测等同于原生升级交付。
+
+- 显示条件：签名通道、已安装版本已知、目录版本严格更高、update 方法存在。缺少方法时说明浏览器尚不支持原地升级，保留卸载入口，不自动卸载。
+- 点击同步调用 update；参数沿用 install 的 extensionId、同源 packageUrl、expectedSha256、可选 operationId。UUID 每次新建，进度来自同命名空间 getter，三重身份匹配外还要求 operation 为 update。
+- 回调成功必须匹配所选包的 ID、product、version，再核对 getStatus。状态待确认单独提示，不重复升级。失败/取消通过原回调与错误码展示，查询失败只影响进度，不替代升级结果。
+- 已实现前端测试覆盖旧浏览器回退、同版/低版/版本未知、不经过卸载、重复点击、实际传参、正常/未知大小进度、任务串扰、失败/取消/重试、坏回执与状态未确认。测试使用模拟浏览器桥，未安装原生扩展。
+
+浏览器宿主仍需追加 update 分发、Foundation 和共享 KernelHost 精确能力与超时登记；校验已安装来源、真实旧包快照、严格版本递增、发布者身份连续性或明确的密钥轮换策略；保留数据与启停状态；新包继续通过验签、摘要、平台、DNR、权限确认与原子事务。取消、文档失效和失败均需回滚后才释放锁，提交后才回调成功。
+
+内核仍需追加 JSON schema/feature/精确成员及校验转发，update 应与 install 同样要求当前顶层受允许来源、Profile、真实手势及同源包地址；进度 operation 枚举新增 update。不新增网站 HTTP 安装/升级写接口。完整合同见在线接口文档的“签名插件升级合同”。签名安装记录不进入目录更新队列；不能因为包来自相同服务器而混用两类更新。[更新服务][update-service]。
 
 ## 10 启停与运行地址
 
@@ -419,7 +430,7 @@ getter 不存在时使用配套新浏览器；存在但返回 signed_extension_h
 
 | 检查 | 结果与范围 |
 | --- | --- |
-| `node test_app.cjs` | 通过；覆盖签名及目录新装、进度关联、未知大小、100% 非安装完成、取消、查询失败、回执、状态可选字段、局域网 UUID、checkUpdate 准备与 applyUpdate 应用边界 |
+| `node test_app.cjs` | 通过；覆盖签名及目录新装、进度关联、未知大小、100% 非安装完成、取消、查询失败、回执、状态可选字段、局域网 UUID、checkUpdate 准备与 applyUpdate 应用边界；新增签名升级模拟桥合同与旧版能力回退验证，未验证真实原生升级 |
 | `python3 -m unittest -q` | 38 项通过；覆盖目录缓存、流式读取、iOS 展示、平台提示、摘要锁定，以及单段范围、416、HEAD、If-Range、超大数字、中断续传、未知长度与原子替换 |
 | `node --check app.js` | 通过 |
 | `bash -n start.sh start.command` | 通过；不替代 Windows 批处理实机运行 |
@@ -449,9 +460,9 @@ Arupa 的[签名安装进度验收报告][progress-report]记录 Mac 安装与�
 
 [demo-app]: /Users/flex/workplace/arupa_webstore_demo/app.js:1
 [demo-mode]: /Users/flex/workplace/arupa_webstore_demo/app.js:69
-[demo-signed]: /Users/flex/workplace/arupa_webstore_demo/app.js:377
-[demo-progress]: /Users/flex/workplace/arupa_webstore_demo/app.js:207
-[demo-refresh]: /Users/flex/workplace/arupa_webstore_demo/app.js:306
+[demo-signed]: /Users/flex/workplace/arupa_webstore_demo/app.js:394
+[demo-progress]: /Users/flex/workplace/arupa_webstore_demo/app.js:212
+[demo-refresh]: /Users/flex/workplace/arupa_webstore_demo/app.js:314
 [demo-http]: /Users/flex/workplace/arupa_webstore_demo/server.py:152
 [demo-catalog]: /Users/flex/workplace/arupa_webstore_demo/crx_catalog.py:245
 [demo-lifecycle]: /Users/flex/workplace/arupa_webstore_demo/storectl.py:132

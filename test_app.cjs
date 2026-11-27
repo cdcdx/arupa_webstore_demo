@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync('app.js', 'utf8');
 const signed = { id: 'a'.repeat(32), name: 'Signed fixture', version: '1.0', size: 841,
-  sha256: '1'.repeat(64), signedProduct: 'demo-addon', requirements: {}, manifest: {} };
+  sha256: '1'.repeat(64), signedProduct: 'demo-addon', requirements: {}, manifest: {}, platforms: ['desktop', 'android', 'ios'] };
 const ordinary = { ...signed, id: 'b'.repeat(32), signedProduct: null };
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
@@ -517,7 +517,62 @@ function signedBrowser(options = {}) {
     assert.equal(iosPage.status(), '安装成功。');
   }
   const iosOnDesktop = await page(signedBrowser().chrome, [iosItem], 'Macintosh');
-  assert.equal(iosOnDesktop.buttons(0)[0].textContent, '安装', 'platform hints never hide packages or remove install entry');
+  assert.equal(iosOnDesktop.actions(0), undefined, 'iOS-only packages are hidden on desktop');
+  assert.match(iosOnDesktop.nodes['#packages'].children[0].children[0].textContent, /当前平台（桌面）没有匹配的插件/);
+
+  // UA filtering precedes status queries and keeps every compatible file/version.
+  const platformItems = [
+    { ...signed, id: 'c'.repeat(32), file: 'desktop.crx', platforms: ['desktop'] },
+    { ...signed, id: 'd'.repeat(32), file: 'android.crx', platforms: ['android'] },
+    { ...signed, id: 'e'.repeat(32), file: 'ios.crx', platforms: ['ios'] },
+    { ...signed, file: 'generic.crx' },
+    { ...signed, id: 'f'.repeat(32), file: 'shared.crx', platforms: ['desktop', 'android'] },
+    { ...signed, id: 'f'.repeat(32), file: 'shared-old.crx', version: '0.9', platforms: ['desktop', 'android'] },
+    { ...signed, file: 'empty-platforms.crx', platforms: [] },
+    { ...signed, file: 'invalid-platforms.crx', platforms: 'desktop' },
+    { ...signed, file: 'unknown-platforms.crx', platforms: ['watchos'] },
+    { ...signed, file: 'missing-platforms.crx', platforms: undefined },
+  ];
+  for (const [agent, touches, expectedPlatform, expectedFiles] of [
+    ['Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)', 0, 'desktop', ['desktop.crx', 'generic.crx', 'shared.crx', 'shared-old.crx']],
+    ['Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 0, 'desktop', ['desktop.crx', 'generic.crx', 'shared.crx', 'shared-old.crx']],
+    ['Mozilla/5.0 (X11; Linux x86_64)', 0, 'desktop', ['desktop.crx', 'generic.crx', 'shared.crx', 'shared-old.crx']],
+    ['Mozilla/5.0 (Linux; Android 14)', 5, 'android', ['android.crx', 'generic.crx', 'shared.crx', 'shared-old.crx']],
+    ['Mozilla/5.0 (iPhone; CPU iPhone OS 18_0)', 5, 'ios', ['ios.crx', 'generic.crx']],
+    ['Mozilla/5.0 (iPod touch; CPU iPhone OS 18_0)', 5, 'ios', ['ios.crx', 'generic.crx']],
+    ['Mozilla/5.0 (iPad; CPU OS 18_0)', 5, 'ios', ['ios.crx', 'generic.crx']],
+    ['Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)', 5, 'ios', ['ios.crx', 'generic.crx']],
+  ]) {
+    const queries = [];
+    const api = { runtime: {}, nomadSignedExtensions: {
+      install() {}, uninstall() {},
+      getStatus(id, cb) { queries.push(id); cb({ extensionId: id, state: 'absent' }); },
+    } };
+    const filtered = await page(api, platformItems, agent, touches);
+    const actual = filtered.nodes['#packages'].children.map(row => row.children[0].children[0].textContent);
+    assert.equal(actual.join(','), expectedFiles.join(','));
+    assert.equal(filtered.requests[0], `/api/catalog?platform=${expectedPlatform}&all=1`);
+    const expectedIds = new Set(platformItems.filter(item => expectedFiles.includes(item.file)).map(item => item.id));
+    assert.equal([...new Set(queries)].sort().join(','), [...expectedIds].sort().join(','));
+    assert.equal(queries.length, expectedIds.size, 'hidden platforms do not trigger status lookups and same-ID versions share a lookup');
+    assert.match(filtered.status(), new RegExp(`已显示 ${expectedFiles.length} 个 CRX 文件`));
+    assert.match(filtered.status(), /已隐藏/);
+  }
+  const noPackages = await page({}, []);
+  assert.match(noPackages.nodes['#packages'].children[0].children[0].textContent, /目录中没有有效的 CRX3/);
+  const allHidden = await page({}, [{ ...signed, platforms: ['android'] }], 'Macintosh');
+  assert.match(allHidden.status(), /当前平台：桌面.*已显示 0 个 CRX.*已隐藏 1/);
+  assert.equal(allHidden.actions(0), undefined, 'filtered empty state has no install/download actions');
+  const sameIdDesktop = { ...signed, file: 'same-id-desktop.crx', platforms: ['desktop'], isLatest: false };
+  const sameIdIos = { ...signed, file: 'same-id-ios.crx', version: '2.0', platforms: ['ios'], isLatest: true };
+  const platformVariantBrowser = signedBrowser();
+  const platformVariants = await page(platformVariantBrowser.chrome, [sameIdIos, sameIdDesktop], 'Macintosh');
+  assert.equal(platformVariants.nodes['#packages'].children.length, 1);
+  assert.equal(platformVariants.nodes['#packages'].children[0].children[0].children[0].textContent, sameIdDesktop.file);
+  assert.doesNotMatch(platformVariants.nodes['#packages'].children[0].children[0].children[2].textContent, /默认安装包/,
+    'filtering must not redefine the backend ID-only default to a different platform file');
+  await platformVariants.context.install(sameIdDesktop);
+  assert.equal(new URL(platformVariantBrowser.calls.find(call => call[0] === 'install')[1].packageUrl).searchParams.get('file'), sameIdDesktop.file);
 
   const legacyCalls = [];
   const legacy = { runtime: {}, management: { getAll: cb => cb([]) }, webstorePrivate: {

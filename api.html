@@ -22,7 +22,7 @@
 </nav></aside>
 <main class="docs-main">
 <header class="docs-header"><p class="eyebrow">逐风扩展商店 Demo</p><h1>安装与进度接口文档</h1>
-<p class="docs-meta">更新于 2026-11-26 · HTTP 协议与浏览器网页接口</p>
+<p class="docs-meta">更新于 2026-11-27 · HTTP 协议与浏览器网页接口</p>
 <p>网站提供目录和 CRX，浏览器负责下载、验证、权限确认与安装事务。本文给前端提供参数、返回值、错误语义和可复制示例；两条安装通道分别说明。整个 Demo 安装流程不查询 Google 商店。</p>
 <p class="doc-callout">前端最小路径：提前读取目录 → 用户点击调用原生安装 → 独立查询进度 → 由原回调判定结果 → 重新读取安装状态。</p></header>
 <section id="overview" aria-labelledby="overview-heading"><h2 id="overview-heading">选择安装通道</h2>
@@ -51,10 +51,10 @@
 <tr><td>sha256 / size / file</td><td>string / number / string</td><td>完整 CRX 的 SHA-256、字节数、原文件名；size ≤ 128 MiB</td></tr>
 <tr><td>isLatest</td><td>boolean，可选</td><td>仅 all=1 时返回；true 表示 ID-only 下载选中的默认包。同版本等价时以文件名排序第一个为默认，其他文件仍独立展示</td></tr>
 <tr><td>signedProduct</td><td>string 或 null</td><td>发布清单元数据提示，不是已验签结论</td></tr>
-<tr><td>platforms</td><td>string[]</td><td>兼容性提示，可含 desktop / android / ios；不限制展示，不参与默认包选择</td></tr>
+<tr><td>platforms</td><td>string[]</td><td>网页筛选依据，可含 desktop / android / ios；只显示包含当前 UA 平台的包。不参与服务端默认包选择，也不替代原生安装校验</td></tr>
 <tr><td>requirements</td><td>object</td><td>可含 responseStageRules；缺失不证明无相关规则，存在也不等于兼容性判定</td></tr>
 <tr><td>errors[]</td><td><code>{file: string, error: string}[]</code></td><td>无效 CRX 的文件名和原因；其他有效包继续返回</td></tr>
-</tbody></table></div><p>桌面、Android、iOS 包统一展示，所有有效 platform 提示返回相同目录。MiVPN 保留引擎和产品元数据推导的平台标签；mivpn-ios 标记 iOS，不要求包内携带桌面或 Android 引擎。通用扩展默认三个平台提示，标签不代表已完成原生兼容性验收。只扫描 packages 第一层 *.crx，复用服务级元数据缓存。</p><p>商店使用 all=1，让每个 CRX 文件独立一行，状态和卸载仍按扩展 ID 共享。签名通道与每行“下载 CRX”使用 id + file + sha256：file 必须来自目录，不能把它直接拼进 URL 路径。指定文件不存在或不属于该 ID 返回 404，摘要变化返回 409，绝不回退其他文件。省略 file 时仍按默认最高版本选包，sha256 只锁定该默认包。普通目录通道只按 ID 取包，因此仅默认包提供安装/升级操作，其他行保留下载。不同通道安装的同 ID 不能互相接管。</p><pre><code id="example-http" data-language="shell">curl &#x27;http://127.0.0.1:18731/api/catalog?platform=desktop&amp;all=1&#x27;
+</tbody></table></div><p>HTTP 接口仍对所有有效 platform 提示返回相同目录；网页另按 UA 筛选 platforms。iPhone/iPad/iPod 和 Macintosh UA 且 maxTouchPoints &gt; 1 的 iPadOS 桌面模式归 iOS，Android UA 归 Android，其余归桌面。只显示 platforms 数组包含当前平台的包；缺失、空数组或无效类型不展示，不查询隐藏项的安装状态。状态栏展示识别平台、可见数量及隐藏数量，无匹配时显示当前平台空状态。</p><p>MiVPN 通过引擎和产品元数据推导平台，mivpn-ios 标记 iOS；通用扩展默认为 desktop/android/ios，三端均可展示。网页过滤只决定列表可见性，原生仍校验签名、权限与兼容性。服务只扫描 packages 第一层 *.crx，复用元数据缓存。</p><p>商店使用 all=1，让兼容的每个 CRX 文件独立一行，状态和卸载仍按扩展 ID 共享。签名通道与每行“下载 CRX”使用 id + file + sha256：file 必须来自目录，不能把它直接拼进 URL 路径。指定文件不存在或不属于该 ID 返回 404，摘要变化返回 409，绝不回退其他文件。省略 file 时仍按默认最高版本选包，sha256 只锁定该默认包，isLatest 不随网页筛选变化。普通目录通道仅默认包提供安装/升级操作，其他行保留下载。不同通道安装的同 ID 不能互相接管。</p><pre><code id="example-http" data-language="shell">curl &#x27;http://127.0.0.1:18731/api/catalog?platform=desktop&amp;all=1&#x27;
 # 将 ID 和摘要替换为上一条目录响应的值；不直接用 file 字段拼路径。
 curl -f &#x27;http://127.0.0.1:18731/api/package?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&amp;platform=desktop&amp;sha256=目录返回的摘要&#x27; -o extension.crx</code></pre><h3>取包与断点续传</h3><p>包响应类型为 <code>application/x-chrome-extension</code>。服务先以不超过 64 KiB 的读取校验整个文件的摘要，再定位同一打开文件并分块发送所需字节。原子替换不会切换已打开的下载；发送前检测到变化返回 409，发送中发现原地改写或截断会中止连接。不要把部分包体当作下载完成。</p>
 <div class="table-wrap"><table><thead><tr><th scope="col">请求或响应头</th><th scope="col">当前行为</th></tr></thead><tbody>
@@ -399,10 +399,11 @@ async function bindSignedInstall() {
   const output = document.querySelector(&#x27;#install-status&#x27;);
   button.disabled = true;
   const platform = currentClientPlatform();
-  const response = await fetch(&#x27;/api/catalog?platform=&#x27; + platform, { cache: &#x27;no-store&#x27; });
+  const response = await fetch(&#x27;/api/catalog?platform=&#x27; + platform + &#x27;&amp;all=1&#x27;, { cache: &#x27;no-store&#x27; });
   if (!response.ok) throw new Error(&#x27;目录 HTTP &#x27; + response.status);
   const { packages } = await response.json();
-  const item = packages.find(item =&gt; item.signedProduct); // 实际商店改为用户选中的目录项。
+  const item = packages.filter(item =&gt; Array.isArray(item?.platforms) &amp;&amp; item.platforms.includes(platform))
+    .find(item =&gt; item.signedProduct); // 实际商店改为用户选中的兼容目录项。
   if (!item) throw new Error(&#x27;目录没有签名插件&#x27;);
   button.textContent = &#x27;安装 &#x27; + item.name;
   button.disabled = false;

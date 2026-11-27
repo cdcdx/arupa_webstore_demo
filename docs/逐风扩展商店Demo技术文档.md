@@ -148,7 +148,9 @@ CRX 下载返回 `application/x-chrome-extension`，整包为 `200`，有效单�
 
 `signedProduct` 来自 `META-INF/nomad-package.json/.sig` 或兼容的 `mivpn-package.json/.sig`。目录只读取元数据和签名文件长度，检查 schema、产品名格式、版本及 ID，**不验证 Ed25519 签名**。它只是前端路由提示。
 
-目录和取包均不按 platform 过滤；三种提示返回相同内容。网页以 all=1 展示每个 CRX 文件，同 ID 多版本及同版本的多个文件均独立成行。getStatus 按 ID 去重查询，各行共用已安装状态；卸载移除该 ID 的当前版本。当前页面识别 iPhone、iPad、iPod 及触控模式的 iPadOS 桌面 UA，并传 ios 提示。
+目录和取包 HTTP 接口不按 platform 过滤，保持宿主兼容。2026-11-27 起网页以 all=1 取目录后按 UA 过滤：iPhone/iPad/iPod，以及 Macintosh UA 且 maxTouchPoints 大于 1 的 iPadOS 桌面模式为 ios；Android UA 为 android；其余为 desktop。仅 platforms 数组包含当前平台的项可见，缺失、空数组、无效类型及未知平台均隐藏。通用包由目录标记为三个平台，继续展示。
+
+兼容的每个 CRX 文件独立成行，同 ID 的多个版本继续保留。先过滤再按 ID 去重查询状态，不对隐藏包调用 getStatus。状态栏显示当前平台、可见文件/ID 数和隐藏数；原目录为空与平台无匹配分别提示。各行仍共用 ID 安装状态。isLatest 保留服务端全局默认包含义，不改成按 UA 的默认包，以免旧宿主按 ID 取错文件。
 
 MiVPN 保留实际引擎与产品元数据推导的提示：桌面识别已知桌面引擎路径，Android 识别 DEX/原生库，mivpn-ios 标记 iOS，即使包内只有 nodes.json 也可展示。通用包默认三个平台提示。标签不是原生安装能力判定，当前浏览器仍须提供对应 API 并完成验证。
 
@@ -372,7 +374,7 @@ cd /Users/flex/workplace/arupa_webstore_demo
 | 停止接口的客户端校验 | 检查 Host、私有 token 和网页请求头，未额外检查 TCP peer 是否 loopback | 不应将现实现状描述为同时验证了回环客户端 IP |
 | macOS 浏览器参数 | open_demo 直接执行路径，未解析 app bundle | --browser 需填写 bundle 内可执行文件；当前也未实现 --no-package-without-length 参数 |
 
-共享目录缓存和文件流式取包已修复；按最新要求取消平台过滤，统一展示 desktop/android/ios 包。表内其余事项保持原有实现，本轮不修改原生安装器或扩展 API 合同。
+共享目录缓存和文件流式取包已修复；按 2026-11-27 要求，网页新增 UA/platforms 匹配过滤，HTTP 接口保持兼容。本轮不修改原生安装器或扩展 API 合同。
 
 ## 12 排查入口
 
@@ -448,6 +450,8 @@ getter 不存在时使用配套新浏览器；存在但返回 signed_extension_h
 
 2026-11-26 手动下载回归：隔离 Chrome 用真实点击触发下载，记录 Browser.downloadWillBegin 和 completed，再从磁盘读取文件核对大小与 SHA-256。本机与公网记录分别见 [manual-download-after/result.json](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/manual-download-after/result.json) 和 [manual-download-public/result.json](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/manual-download-public/result.json)。这是标准 Chrome 的真实落盘验证，不代表逐风 Mac GUI 已验收；用户所报逐风点击无反应仍需配套实机确认。测试下载仅保存在忽略的 .runtime/qa 下。
 
+2026-11-27 UA 筛选回归：Node 测试覆盖 Mac/Windows/Linux、Android、iPhone/iPod/iPad、iPadOS 桌面 UA 与触控识别，平台字段缺失/无效、空目录/无匹配、隐藏项不查询状态、同 ID 跨平台版本以及精确安装文件选择。隔离 Chrome 又对六种 UA/触控组合渲染当前真实目录，确认展示文件与 platforms 一致，见 [ua-platform-filter.json](/Users/flex/workplace/arupa_webstore_demo/.runtime/qa/ua-platform-filter.json)。这是网页识别与渲染验证，不代表各端原生安装验收。
+
 Arupa 的[签名安装进度验收报告][progress-report]记录 Mac 安装与能力测试 46 项通过，Windows/Linux 签名安装测试各 18 项通过，并记录 Mac arm64 隔离 Release/Prod 第二版浏览器通过 HTTPS 完成两次 MiVPN 安装，观察到真实下载字节及权限等待、安装、完成阶段，随后完成网页卸载。该报告明确未重复 Windows/Linux GUI 闭环与本轮重启加载；这些范围不应写成三端全部实机验收完成。本轮修复验证 Demo HTTP 行为和安装接口交互，未重新执行浏览器原生安装。
 
 交付应同时核对 Demo 版本、实际运行的 Nomad 宿主程序集、Arupa SDK/内核以及该平台的能力快照。旧日常 release-2 包与报告中的隔离 release-prod-2 验证包是不同产物，不能仅凭编号相近认定具备同样能力。
@@ -466,10 +470,10 @@ Arupa 的[签名安装进度验收报告][progress-report]记录 Mac 安装与�
 | 验证与权限 | [安装器][installer]、[签名安装器][signed-installer]、[CRX 处理][crx-verifier]、[原生发布签名验证][publisher-verifier]、[权限窗口][consent-window]、[确认会话][consent-session] |
 
 [demo-app]: /Users/flex/workplace/arupa_webstore_demo/app.js:1
-[demo-mode]: /Users/flex/workplace/arupa_webstore_demo/app.js:69
-[demo-signed]: /Users/flex/workplace/arupa_webstore_demo/app.js:425
-[demo-progress]: /Users/flex/workplace/arupa_webstore_demo/app.js:228
-[demo-refresh]: /Users/flex/workplace/arupa_webstore_demo/app.js:347
+[demo-mode]: /Users/flex/workplace/arupa_webstore_demo/app.js:75
+[demo-signed]: /Users/flex/workplace/arupa_webstore_demo/app.js:435
+[demo-progress]: /Users/flex/workplace/arupa_webstore_demo/app.js:234
+[demo-refresh]: /Users/flex/workplace/arupa_webstore_demo/app.js:354
 [demo-http]: /Users/flex/workplace/arupa_webstore_demo/server.py:152
 [demo-catalog]: /Users/flex/workplace/arupa_webstore_demo/crx_catalog.py:319
 [demo-lifecycle]: /Users/flex/workplace/arupa_webstore_demo/storectl.py:132

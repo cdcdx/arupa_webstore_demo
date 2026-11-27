@@ -11,6 +11,7 @@ let currentOperation = 'install';
 let busy = false;
 let catalogReady = false;
 let packages = [];
+let catalogFileCount = 0;
 let installed = new Map();
 const prepared = new Map();
 const statusErrors = new Map();
@@ -18,6 +19,11 @@ const userAgent = window.navigator?.userAgent || '';
 const platform = /iPad|iPhone|iPod/i.test(userAgent) ||
   /Macintosh/i.test(userAgent) && (window.navigator?.maxTouchPoints || 0) > 1 ? 'ios' :
   /Android/i.test(userAgent) ? 'android' : 'desktop';
+const platformLabels = { desktop: 'Desktop', android: 'Android', ios: 'iOS' };
+
+function supportsCurrentPlatform(item) {
+  return Array.isArray(item?.platforms) && item.platforms.includes(platform);
+}
 
 function show(message) { status.textContent = message; }
 function installErrorMessage(error, item, action = '安装') {
@@ -285,7 +291,9 @@ function render() {
   if (!packages.length) {
     const row = rows.insertRow();
     const cell = row.insertCell(); cell.colSpan = 5;
-    cell.textContent = '目录中没有有效的 CRX3 文件。将 .crx 放入 packages/ 后点击刷新。';
+    cell.textContent = catalogFileCount
+      ? `当前平台（${platformLabels[platform]}）没有匹配的插件。`
+      : '目录中没有有效的 CRX3 文件。将 .crx 放入 packages/ 后点击刷新。';
   }
   for (const item of packages) {
     const current = installed.get(item.id);
@@ -300,9 +308,8 @@ function render() {
     title.append(file);
     const hint = document.createElement('div');
     hint.className = 'file-name';
-    const labels = { desktop: '桌面', android: 'Android', ios: 'iOS' };
     hint.textContent = `平台提示：${Array.isArray(item.platforms) && item.platforms.length
-      ? item.platforms.map(value => labels[value] || value).join(' / ') : '未声明，以浏览器校验为准'}`;
+      ? item.platforms.map(value => platformLabels[value] || value).join(' / ') : '未声明，以浏览器校验为准'}`;
     title.append(hint);
     const identity = document.createElement('div');
     identity.className = 'file-name';
@@ -352,7 +359,8 @@ async function refresh({ internal = false } = {}) {
   try {
     const catalog = await fetchJson(`/api/catalog?platform=${platform}&all=1`);
     if (!Array.isArray(catalog.packages) || !Array.isArray(catalog.errors)) throw new Error('目录响应格式无效');
-    packages = catalog.packages;
+    catalogFileCount = catalog.packages.length;
+    packages = catalog.packages.filter(supportsCurrentPlatform);
     for (const [id, hash] of prepared) {
       if (!packages.some(item => item.id === id && item.sha256 === hash)) prepared.delete(id);
     }
@@ -378,8 +386,10 @@ async function refresh({ internal = false } = {}) {
       } catch (error) { statusErrors.set(item.id, `读取安装状态失败：${error.message}`); }
     }));
     catalogReady = true;
-    const summary = packages.some(item => installMode(item)) ? `已读取 ${packages.length} 个 CRX 文件，共 ${new Set(packages.map(item => item.id)).size} 个扩展 ID。` :
-      '请使用新版逐风浏览器。公网地址可安装带逐风发布签名的扩展，普通 CRX 请从本机商店安装。';
+    const summary = `当前平台：${platformLabels[platform]}。已显示 ${packages.length} 个 CRX 文件，共 ${new Set(packages.map(item => item.id)).size} 个扩展 ID。` +
+      (catalogFileCount > packages.length ? ` 已隐藏 ${catalogFileCount - packages.length} 个平台不匹配或未声明支持平台的文件。` : '') +
+      (packages.length && !packages.some(item => installMode(item))
+        ? ' 请使用新版逐风浏览器。公网地址可安装带逐风发布签名的扩展，普通 CRX 请从本机商店安装。' : '');
     show(catalog.errors?.length ? `有 ${catalog.errors.length} 个 CRX 无效：${catalog.errors.map(e => e.file + ' (' + e.error + ')').join('，')}` :
       statusErrors.size ? `${summary} 有 ${statusErrors.size} 个插件的安装状态读取失败，请刷新重试。` : summary);
     return true;

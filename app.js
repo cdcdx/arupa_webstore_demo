@@ -101,7 +101,7 @@ function packageUrl(item, download = false) {
 }
 function unavailableMessage(item) {
   if (item.signedProduct) return '请使用支持签名网页安装的新版逐风浏览器';
-  return '无签名';
+  return '没有普通插件安装接口';
 }
 function callChrome(target, method, ...args) {
   return new Promise((resolve, reject) => {
@@ -324,7 +324,7 @@ function render() {
     else if (!mode || operationError(item)) {
       actions.textContent = operationError(item) ? '请在对应通道操作或刷新重试' : unavailableMessage(item);
     } else if (!catalogFileAllowed(item)) {
-      actions.textContent = '此文件可下载；当前浏览器的目录通道仅支持安装或升级到默认包。';
+      actions.textContent = '目录通道仅支持默认包';
     } else if (!current) actions.append(button('安装', () => void install(item)));
     else {
       if (upgrade && canUpdate(item)) actions.append(prepared.get(item.id) === item.sha256

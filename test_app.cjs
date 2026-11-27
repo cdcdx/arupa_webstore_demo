@@ -76,7 +76,7 @@ function signedBrowser(options = {}) {
   assert.equal(unsupported.buttons(0).length, 0);
   assert.equal(unsupported.buttons(1).length, 0);
   assert.match(unsupported.actions(0).textContent, /新版逐风/);
-  assert.equal(unsupported.actions(1).textContent, '无签名');
+  assert.match(unsupported.actions(1).textContent, /没有普通插件安装接口.*本机或局域网 HTTP 18731/);
   assert.equal(unsupported.nodes['#packages'].children[0].children[3].textContent, '无法读取');
   assert.equal(unsupported.nodes['#install-progress'].hidden, false, 'the progress panel is visible before installing');
   assert.match(unsupported.nodes['#progress-note'].textContent, /逐风浏览器/);
@@ -518,7 +518,7 @@ function signedBrowser(options = {}) {
   }
   const iosOnDesktop = await page(signedBrowser().chrome, [iosItem], 'Macintosh');
   assert.equal(iosOnDesktop.actions(0), undefined, 'iOS-only packages are hidden on desktop');
-  assert.match(iosOnDesktop.nodes['#packages'].children[0].children[0].textContent, /当前平台（桌面）没有匹配的插件/);
+  assert.match(iosOnDesktop.nodes['#packages'].children[0].children[0].textContent, /当前平台（(?:桌面|Desktop)）没有匹配的插件/);
 
   // UA filtering precedes status queries and keeps every compatible file/version.
   const platformItems = [
@@ -561,7 +561,7 @@ function signedBrowser(options = {}) {
   const noPackages = await page({}, []);
   assert.match(noPackages.nodes['#packages'].children[0].children[0].textContent, /目录中没有有效的 CRX3/);
   const allHidden = await page({}, [{ ...signed, platforms: ['android'] }], 'Macintosh');
-  assert.match(allHidden.status(), /当前平台：桌面.*已显示 0 个 CRX.*已隐藏 1/);
+  assert.match(allHidden.status(), /当前平台：(?:桌面|Desktop).*已显示 0 个 CRX.*已隐藏 1/);
   assert.equal(allHidden.actions(0), undefined, 'filtered empty state has no install/download actions');
   const sameIdDesktop = { ...signed, file: 'same-id-desktop.crx', platforms: ['desktop'], isLatest: false };
   const sameIdIos = { ...signed, file: 'same-id-ios.crx', version: '2.0', platforms: ['ios'], isLatest: true };
